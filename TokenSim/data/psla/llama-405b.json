@@ -1,0 +1,21 @@
+{
+    "name": "llama405b",
+    "model": "Llama-3.1-405B",
+    "qps": 1000,
+    "distribution": "poisson",
+    "prefill_mean_len": 1024,
+    "prefill_range_len": -1,
+    "decode_mean_len": 1024,
+    "decode_range_len": -1,
+    "decode_len_distribution": "uniform",
+    "first_token_latency": {
+        "max": 10,
+        "p50": 2,
+        "p99": 3
+    },
+    "decode_token_latency": {
+        "p50": 0.02,
+        "p99": 0.05,
+        "max": 1
+    }
+}

@@ -1,0 +1,19 @@
+{
+    "num_workers": 8,
+    "networks": {
+        "netw1": "ethernet100Gb"
+    },
+    "worker_groups": [
+        {
+            "role": "hybrid",
+            "hardware": "H3-KVONLY-B200",
+            "num_workers": 8,
+            "network": "netw1"
+        }
+    ],
+    "parallel_config": {
+        "tensor_parallel_size": 8,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1
+    }
+}
