@@ -20,6 +20,15 @@ SUPPORTED_DEMOTE_POLICIES = {"always", "if_read"}
 SUPPORTED_MEMORY_MEDIA = {"dram", "pcm"}
 SUPPORTED_ADMISSION_WRITE_POLICIES = {"write_through", "write_back"}
 SUPPORTED_SAVE_POLICIES = {"mooncake", "every_step", "once"}
+# What an HBM (GPU prefix-cache) eviction does. "prefill" is stock: HBM eviction
+# is invisible to the store, which is written only by the prefill save path.
+# "count" adds instrumentation and nothing else. "on_evict" additionally sends
+# the evicted block to the store through the normal put path, i.e. the prefill
+# save PLUS an eviction-driven save.
+#
+# Spelled hbm_evict_save_policy, not save_policy: save_policy already exists
+# above and means how often the *prefill* save re-runs (mooncake/every_step/once).
+SUPPORTED_HBM_EVICT_SAVE_POLICIES = {"prefill", "count", "on_evict"}
 
 _GB = 1 << 30
 
@@ -76,6 +85,7 @@ class MooncakeConfig:
     # "every_step" re-saves a request's prompt blocks on every scheduled step
     # (historical behavior); "once" saves each request a single time.
     save_policy: str = "mooncake"
+    hbm_evict_save_policy: str = "prefill"
     load_async: bool = False
     transfer_overlap: bool = False
     num_nics: int = 1
@@ -143,6 +153,12 @@ class MooncakeConfig:
                 "unsupported Mooncake save_policy "
                 + f"{self.save_policy!r}; expected one of "
                 + f"{sorted(SUPPORTED_SAVE_POLICIES)}"
+            )
+        if self.hbm_evict_save_policy not in SUPPORTED_HBM_EVICT_SAVE_POLICIES:
+            raise ConfigurationError(
+                "unsupported Mooncake hbm_evict_save_policy "
+                + f"{self.hbm_evict_save_policy!r}; expected one of "
+                + f"{sorted(SUPPORTED_HBM_EVICT_SAVE_POLICIES)}"
             )
         for field_name in (
             "global_segment_size",

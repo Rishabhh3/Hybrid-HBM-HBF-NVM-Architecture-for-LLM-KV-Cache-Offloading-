@@ -179,6 +179,12 @@ class LLMPagedAttnScheduler(LLMScheduler):
         set_releaser = getattr(self.connector, "set_block_releaser", None)
         if set_releaser is not None:
             set_releaser(self._release_delayed_blocks)
+        # Connectors that want to see HBM evictions expose a non-None observer;
+        # under the stock hbm_evict_save_policy none do, and the prefix cache
+        # keeps no hook at all.
+        evict_observer = getattr(self.connector, "hbm_evict_observer", None)
+        if evict_observer is not None:
+            self.block_manager.kv_cache_manager.set_evict_observer(evict_observer)
 
     def schedule(self) -> tuple[list[Request], list[Request]]:
         """The scheduler FSM for dynamic scheduling, basically being ported

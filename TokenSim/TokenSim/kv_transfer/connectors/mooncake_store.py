@@ -4,7 +4,13 @@ from typing import Any
 
 from TokenSim.config.config import CacheConfig, KVTransferConfig
 from TokenSim.llm.llm_request import Request
-from TokenSim.mooncake import PoolKey, Segment, pool_keys_for_request
+from TokenSim.mooncake import (
+    PoolKey,
+    Segment,
+    build_key_metadata,
+    pool_keys_for_request,
+    prefix_key_digest,
+)
 from TokenSim.mooncake.service import get_mooncake_service
 
 from .base import BaseKVConnector
@@ -49,6 +55,14 @@ class MooncakeStoreConnector(BaseKVConnector):
         self._pending_async_puts: set[int] = set()
         self._delayed_releases: dict[int, tuple[Request, list[int]]] = {}
         self._block_releaser: Any | None = None
+        # HBM-eviction hook. "prefill" (stock) leaves the observer None so the
+        # prefix cache never calls in and no counter moves.
+        self._hbm_evict_policy = self.service.config.hbm_evict_save_policy
+        self._hbm_evict_metadata: Any | None = None
+        self._hbm_evict_seq = 0
+        self._pending_evict_latency = 0.0
+        if self._hbm_evict_policy != "prefill":
+            self.mooncake_stats.hbm_evict_reporting = 1
 
     def get_num_new_matched_tokens(
         self,
@@ -90,6 +104,105 @@ class MooncakeStoreConnector(BaseKVConnector):
 
     def set_block_releaser(self, releaser) -> None:
         self._block_releaser = releaser
+
+    @property
+    def hbm_evict_observer(self):
+        """Hook for KVCacheManager.evict, or None under the stock policy."""
+        if self._hbm_evict_policy == "prefill":
+            return None
+        return self._on_hbm_evict
+
+    def _on_hbm_evict(self, block: Any, reason: str) -> None:
+        """One block is leaving the GPU prefix cache.
+
+        Counts it under every policy but "prefill"; additionally writes it back
+        into the store under "on_evict", through the same
+        ``store.put_with_timing`` the prefill save uses, so the eviction cascade
+        and ``charge_eviction_writes`` behave identically to any other write.
+
+        Every block reaching the capacity site carries a key: ``block.cached``
+        is set only by register_blocks, and BlockAllocator.allocate consults the
+        prefix cache only for cached blocks. Decode blocks are never cached, so
+        this hook sees prompt blocks and nothing else.
+        """
+        stats = self.mooncake_stats
+        stats.hbm_evict_calls += 1
+        if reason != "capacity":
+            stats.hbm_evict_rekey_calls += 1
+            return
+        stats.hbm_evict_blocks += 1
+        stats.hbm_evict_bytes += self.block_bytes
+
+        prefix_key = getattr(block, "block_hash", None)
+        if prefix_key is None:
+            # Unreachable for the reason in the docstring; counted rather than
+            # handled, so that a future scheduler change that breaks the
+            # invariant shows up as a non-zero number instead of a wrong key.
+            stats.hbm_evict_unkeyed_blocks += 1
+            return
+        stats.hbm_evict_prompt_blocks += 1
+        stats.hbm_evict_keyed_blocks += 1
+        key = PoolKey(self._hbm_evict_key_metadata(), prefix_key_digest(prefix_key))
+
+        # missing_indices is the save-side existence check and touches no
+        # hit/miss statistics or LRU heat, so counting here does not perturb
+        # the run the way a lookup() would.
+        present = not self.service.store.missing_indices([key])
+        if present:
+            stats.hbm_evict_present_blocks += 1
+        else:
+            stats.hbm_evict_absent_blocks += 1
+
+        if self._hbm_evict_policy != "on_evict":
+            return
+        # Bytes are read off the store's own counters rather than assumed, so
+        # the figure includes any cascade eviction this put forced.
+        before = stats.memory_write_bytes + stats.ssd_write_bytes
+        timing = self.service.store.put_with_timing(
+            [key],
+            blocks=1,
+            now=self.simulation_time,
+        )
+        written = stats.memory_write_bytes + stats.ssd_write_bytes - before
+        stats.hbm_evict_puts += 1
+        stats.hbm_evict_write_bytes += written
+        if written:
+            stats.hbm_evict_puts_wrote_bytes += 1
+        else:
+            stats.hbm_evict_puts_refresh_only += 1
+        stats.hbm_evict_save_latency += timing.blocking_latency
+        self._pending_evict_latency += timing.blocking_latency
+
+    def _hbm_evict_key_metadata(self):
+        if self._hbm_evict_metadata is None:
+            self._hbm_evict_metadata = build_key_metadata(
+                model_name=self.model_name,
+                rank_info=self.rank_info,
+                engine_id=self.config.engine_id or "default",
+                group_id=int(self.service.config.group_id),
+                pcp_rank=int(self.service.config.pcp_rank),
+                dcp_rank=int(self.service.config.dcp_rank),
+            )
+        return self._hbm_evict_metadata
+
+    def _drain_evict_latency(self) -> float:
+        """Media time owed for this step's eviction saves.
+
+        Charged as a store_save so it lands in save_wait_time with the rest of
+        the write stalls. No bytes are added to transferred_bytes: an eviction
+        save moves no data across the interconnect -- the block is already on
+        this worker -- and its media bytes are counted by the store itself.
+        """
+        pending = self._pending_evict_latency
+        self._pending_evict_latency = 0.0
+        if pending:
+            self.mooncake_stats.record_transfer(
+                bytes_=0,
+                latency=pending,
+                kind="store_save",
+                blocking_latency=pending,
+            )
+        return pending
 
     def update_state_after_alloc(
         self,
@@ -185,7 +298,8 @@ class MooncakeStoreConnector(BaseKVConnector):
         return latency
 
     def wait_for_save(self) -> float:
-        latency = 0.0
+        evict_latency = self._drain_evict_latency()
+        latency = evict_latency
         for plan in self._own_plans(self._metadata.saves):
             keys = self._pool_keys_from_plan(plan)
             store_timing = self.service.store.put_with_timing(
@@ -217,7 +331,9 @@ class MooncakeStoreConnector(BaseKVConnector):
             self.mooncake_stats.record_pool_keys(plan.keys)
         if self.service.config.load_async and self.service.config.transfer_overlap:
             self.mooncake_stats.pending_async_jobs += len(self._metadata.saves)
-            return 0.0
+            # Eviction saves are not part of the async plan, so their time is
+            # still owed even when the plan saves overlap.
+            return evict_latency
         return latency
 
     def request_finished(

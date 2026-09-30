@@ -44,6 +44,35 @@ class PoolKey:
         )
 
 
+def build_key_metadata(
+    *,
+    model_name: str,
+    rank_info: ParallelRankInfo | None = None,
+    engine_id: str = "default",
+    group_id: int = 0,
+    pcp_rank: int = 0,
+    dcp_rank: int = 0,
+) -> KeyMetadata:
+    """The per-rank metadata half of a pool key.
+
+    Extracted so that any other key an engine mints for its own blocks lands in
+    the same key space as the request's prefill save; a second, drifting copy of
+    this construction would silently produce keys that never match.
+    """
+    rank_info = rank_info or ParallelRankInfo()
+    return KeyMetadata(
+        model_name=model_name,
+        tp_rank=rank_info.tp_rank,
+        pp_rank=rank_info.pp_rank,
+        dp_rank=rank_info.dp_rank,
+        engine_id=engine_id,
+        kv_cache_group_id=rank_info.kv_cache_group_id,
+        group_id=group_id,
+        pcp_rank=pcp_rank,
+        dcp_rank=dcp_rank,
+    )
+
+
 def pool_keys_for_request(
     req: Request,
     *,
@@ -56,7 +85,6 @@ def pool_keys_for_request(
 ) -> list[PoolKey]:
     if not req.hash_ids:
         return []
-    rank_info = rank_info or ParallelRankInfo()
     full_input_blocks = req.prefill_len // req.block_size
     prefix_keys = build_prefix_keys(
         req.hash_ids[:full_input_blocks],
@@ -64,24 +92,21 @@ def pool_keys_for_request(
         cache_salt=req.cache_salt,
         reuse_group=req.reuse_group,
     )
-    metadata = KeyMetadata(
+    metadata = build_key_metadata(
         model_name=model_name,
-        tp_rank=rank_info.tp_rank,
-        pp_rank=rank_info.pp_rank,
-        dp_rank=rank_info.dp_rank,
+        rank_info=rank_info,
         engine_id=engine_id,
-        kv_cache_group_id=rank_info.kv_cache_group_id,
         group_id=group_id,
         pcp_rank=pcp_rank,
         dcp_rank=dcp_rank,
     )
     return [
-        PoolKey(metadata, _prefix_key_digest(key))
+        PoolKey(metadata, prefix_key_digest(key))
         for key in prefix_keys
     ]
 
 
-def _prefix_key_digest(key: PrefixCacheKey) -> str:
+def prefix_key_digest(key: PrefixCacheKey) -> str:
     return _stable_hash(
         {
             "parent_hash": key.parent_hash,
@@ -89,6 +114,11 @@ def _prefix_key_digest(key: PrefixCacheKey) -> str:
             "extra_hash": key.extra_hash,
         }
     )
+
+
+# Retained name for the module-private spelling used before the digest became
+# part of the module's surface.
+_prefix_key_digest = prefix_key_digest
 
 
 def _stable_hash(value: Any) -> str:

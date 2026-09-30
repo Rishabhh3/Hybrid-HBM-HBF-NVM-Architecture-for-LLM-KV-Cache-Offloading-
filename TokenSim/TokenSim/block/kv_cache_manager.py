@@ -45,6 +45,10 @@ class KVCacheManager:
     def __init__(self, block_size: int, model: str):
         self.block_size = block_size
         self.model = model
+        # Optional hook fired just before an entry leaves the GPU prefix cache,
+        # while the block still carries its key. None (stock) means HBM
+        # eviction stays invisible to everything outside this class.
+        self.evict_observer = None
         self._cache: dict[PrefixCacheKey, PhysicalTokenBlock] = {}
         self._access_counter = 0
         # plan_reuse() runs for the waiting-queue head on every scheduling
@@ -94,7 +98,7 @@ class KVCacheManager:
     ) -> None:
         for block, key in zip(blocks, keys):
             if block.block_hash is not None and block.block_hash != key:
-                self.evict(block)
+                self.evict(block, reason="rekey")
             block.block_hash = key
             block.is_full = True
             block.cached = True
@@ -155,7 +159,22 @@ class KVCacheManager:
         else:
             free_queue.append_lru(block)
 
-    def evict(self, block: PhysicalTokenBlock) -> None:
+    def set_evict_observer(self, observer) -> None:
+        """Install the hook called by :meth:`evict`; None disables it."""
+        self.evict_observer = observer
+
+    def evict(self, block: PhysicalTokenBlock, *, reason: str = "capacity") -> None:
+        """Drop ``block`` from the prefix cache index.
+
+        ``reason`` is "capacity" when BlockAllocator.allocate repurposed a
+        cached free block because HBM is full, and "rekey" when register_blocks
+        is reassigning a block that already carried a different key. Only the
+        first is HBM pressure; the observer is told which so it can tell them
+        apart. It runs before the metadata is cleared, so the block still has
+        its key.
+        """
+        if self.evict_observer is not None:
+            self.evict_observer(block, reason)
         if block.block_hash is not None and self._cache.get(block.block_hash) is block:
             self._cache.pop(block.block_hash, None)
         block.clear_cache_metadata()

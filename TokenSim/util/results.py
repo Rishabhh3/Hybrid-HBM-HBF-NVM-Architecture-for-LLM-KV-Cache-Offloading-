@@ -462,6 +462,17 @@ def export_result(
     results_path.mkdir(parents=True, exist_ok=True)
 
     result_dict = asdict(result)
+    # LLMResult is a pydantic dataclass: keys it does not declare are dropped
+    # silently. The HBM-eviction counters are optional -- absent entirely under
+    # the stock hbm_evict_save_policy -- so they are merged in here rather than
+    # declared, which would add null-valued keys to every stock result.
+    result_dict.update(
+        {
+            name: value
+            for name, value in mooncake_stats.items()
+            if name.startswith("hbm_evict_")
+        }
+    )
     result_dict["cluster"] = asdict(result.cluster)
     result_dict["request_time"] = asdict(result.request_time)
     result_dict["prefill_time"] = asdict(result.prefill_time)

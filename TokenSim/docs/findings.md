@@ -4207,3 +4207,739 @@ Scope unchanged: Mooncake conversational and Tool&Agent traces as **stand-ins
 for CAG**; FP16 KV (hardcoded, conservative); saturated regime (this phase runs
 at 30 QPS against the traces' natural 3 QPS, so its latency numbers are not
 comparable to PHASE 8's).
+
+---
+
+# PHASE 12 — Falsifier: does HBM eviction pressure drive far-tier writes?
+
+**Hypothesis under test.** PHASE 9 STEP 4 found HBF bytes/request flat in batch
+size and attributed that to HBM eviction never reaching the Mooncake store. If
+an HBM eviction *did* write its victim to the store, HBF bytes/request would
+depend on HBM occupancy.
+
+**Decision rule, fixed before any run.** With the eviction hook ON, config (b),
+if HBF bytes/request at the high-batch point differs from the low-batch point by
+**< 5% on both traces**, the hypothesis is dead.
+
+**Result: it is dead. +0.00% (Conversation), −0.07% (Tool&Agent).** Details
+below, numbers first.
+
+**Scope of the verdict.** It covers **prompt-block eviction only.** No decode
+block reaches the hook — see STEP 0(b). Generated KV is untouched by this phase,
+and the SCOPE STATEMENT above still stands in full.
+
+## Provenance — the workload and harness were rebuilt, then proved identical
+
+Neither trace file, nor `build_trace.py`, nor the PHASE 9/11 `run_one.py`
+survived on this machine; every prior session scratchpad was empty. All were
+rebuilt from the recipes in this document and are now committed under
+`scripts/phase12/` so this cannot recur.
+
+Source: the FAST'25 release traces, fetched from `kvcache-ai/Mooncake`
+(`FAST25-release/traces/`).
+
+| file | md5 |
+|---|---|
+| `conversation_trace.jsonl` (raw) | `bc2f368504912f72f59caee90b5f2e46` |
+| `toolagent_trace.jsonl` (raw) | `53cf2bc5eff72e9953348bda80028c93` |
+| **`conv_5000.jsonl` (built)** | **`5a19d814562e650fe6e44e4234a4793c`** |
+| **`toolagent_5000.jsonl` (built)** | **`c6cd3b0c8022eebb88358719a2596f1c`** |
+| `data/hardware/hardware_models_h3b200.json` | `9b4cba823dd4158d9bd3efe16bf74491` |
+
+The hardware catalogue md5 is byte-identical to the one PHASE 11 recorded, so
+the hardware side is provably the same file. `build_trace.py` follows the recipe
+at ~line 2277 verbatim: first N requests, timestamps ms→s, each 512-token hash
+id expanded to sub-ids `32h … 32h+31` and truncated to `ceil(input_length/16)`.
+
+**The raw FAST'25 traces carry no `cache_salt` field**, so none is emitted —
+whereas the description above of the old files lists one. This cannot change any
+number reported here: `cache_salt` reaches the simulator only through
+`make_extra_hash` (`prefix_cache.py:16-27`), which salts every key in a run
+identically, so a constant salt and an absent one give identical block, byte and
+hit counts and differ only in the literal key strings. A *per-request* salt would
+have destroyed all cross-request reuse and is excluded by the hit rates below.
+
+### Reproduction gate — 12 independently recorded values, all exact
+
+Nothing was tuned to make these match; they came out on the first run.
+
+**Workload statistics** (counted with the store's own truncation, `//16`):
+
+| | prompt-block instances | distinct blocks | input mean/median | output mean/median |
+|---|---|---|---|---|
+| Conversation | **4,080,885** ✓ | **2,695,220** ✓ | **13,066 / 7,748** ✓ | **346 / 356** ✓ |
+| Tool&Agent | **2,908,548** ✓ | **1,397,479** ✓ | **9,315 / 6,397** ✓ | **185 / 30** ✓ |
+
+**Simulator, config (b) at cap 48, 30 QPS, W = 5,000** — against the PHASE 9
+STEP 3 rows (~line 4128/4130):
+
+| | HBF write bytes | HBF write blocks | hit rate | reuse hit blocks | batch/sched | peak HBM |
+|---|---|---|---|---|---|---|
+| Conversation | **16,853,376,696,320** ✓ | **6,429,053** ✓ | **0.1643** ✓ | **670,585** ✓ | **23.167889** ✓ | 85.66% ✓ |
+| Tool&Agent | **8,483,936,665,600** ✓ | **3,236,365** ✓ | **0.4037** ✓ | **1,174,042** ✓ | **22.885048** ✓ | 75.12% ✓ |
+
+`batch_num_gpu_blocks_per_rank = 78,643` in both, as recorded. The four PHASE 9
+STEP 4 stock rows reproduce exactly too — see the `stock` rows of the main table.
+
+## STEP 0 — recon (line numbers current as of `4e9b9fe`)
+
+**a. The call chain, with a site the brief did not have.** `KVCacheManager.evict`
+(`kv_cache_manager.py:158`) has **two** callers, not one:
+
+| site | trigger |
+|---|---|
+| `BlockAllocator.allocate` → `evict(block)` (`block_manager.py:38-42`) | capacity: a **cached** free block is repurposed |
+| `KVCacheManager.register_blocks` → `evict(block)` (`kv_cache_manager.py:96-97`) | re-keying a block that already carried a different key |
+
+Only the first is HBM pressure. They are counted separately
+(`hbm_evict_blocks` vs `hbm_evict_rekey_calls`); **the re-key site fired 0 times
+in all eight runs.** Release paths confirmed to write nothing to the store:
+`llm_scheduler.py:319-325` and `:365-367`.
+
+**b. What is repurposed: full prompt blocks, never decode blocks.** Three
+independent reasons, all verified in code and then in the counters
+(`hbm_evict_unkeyed_blocks = 0` in every run):
+
+1. `BlockPool.pop_free_block` (`block_pool.py:27-33`) hands out fresh ids first,
+   so `evict` cannot fire until all `num_blocks` ids have been materialised once.
+2. `FreeBlockQueue.popleft` (`free_queue.py:72-81`) serves uncached FIFO entries
+   before any cached LRU entry, so the uncached pool must be exhausted too.
+3. `block.cached` is set only by `register_blocks`, reached from
+   `_commit_input_cache` with `req.input_cache_keys` — the prompt range only. A
+   decode block from `append_slot` has `cached = False`; on release,
+   `release_block` (`kv_cache_manager.py:152-154`) wipes its metadata, and
+   `allocate` then skips the evict branch entirely.
+
+**The generated-block branch at this hook is therefore unreachable and was not
+built.** The counter that would have caught it is kept.
+
+**c. What `put` does on a key the store already has: LRU refresh, zero bytes.**
+`_put_one` (`store.py:191-202`) sees `existing is not None`, calls `_touch`, and
+returns an empty `StoreWriteTiming`. So an eviction-driven save produces a new
+far-tier write **only** for a key the store does not currently hold. Under config
+(b) (`write_through` + `always`) nothing is ever removed from `store.objects` —
+`_drops_on_eviction` is False and `ssd_eviction_count = 0` — so the only way a
+key can be absent is that it was never written: `_aligned` save semantics
+(`mooncake_store.py:131-137`) mark a request saved and then **skip its save
+entirely if that step also loaded from the store**, leaving that request's miss
+blocks in HBM but not in the store. Measured, that channel is **2.0–3.0%** of
+evicted blocks.
+
+**d. Batch points** — the lowest- and highest-occupancy rows of the PHASE 9
+STEP 4 sweep (~line 3645/3661), copied verbatim: Conversation `--max_parallem_sum`
+**8** (peak HBM 25.0%) and **256** (99.2%); Tool&Agent **8** (29.5%) and **96**
+(99.1%). W = 5,000, 30 QPS offered, `memory_capacity_blocks = 142213`,
+`ssd_capacity_blocks = 10066329`, `charge_eviction_writes = ON`, `H3-B200-KVONLY`,
+`LLaMa2-70B-GQA` TP2/DP4, block 2,621,440 B, FP16, `--random_seed 0`.
+
+## The flag
+
+`save_policy` was already taken (`config.py:87`, values `mooncake`/`every_step`/
+`once`, meaning how often the *prefill* save re-runs), so the new knob is
+**`hbm_evict_save_policy`**:
+
+| value | meaning |
+|---|---|
+| **`prefill`** | **default, stock.** No observer installed; no counter emitted. |
+| `count` | instrumentation only — no store write, no behaviour change |
+| `on_evict` | prefill save **plus** an eviction-driven save |
+
+**Byte-identity at default, verified.** Both traces, config (b), cap 48, against
+stock `4e9b9fe`:
+
+```
+strip(){ python -c "import json,sys;d=json.load(open(sys.argv[1]));
+  [d.pop(k,None) for k in ('simulator_wall_time','mooncake_pool_keys')];
+  print(json.dumps(d,sort_keys=True,indent=1))" "$1"; }
+diff <(strip head/result_30.0.json) <(strip p12_default/result_30.0.json)
+```
+
+→ **no output for either trace.** `count` is behaviourally stock as well: every
+non-`hbm_evict_*` field of the four `stock` rows below matches the PHASE 9
+STEP 4 figures exactly.
+
+**Tests: 177 pass** (158 pre-existing, unchanged, plus 19 new in
+`tests/test_hbm_evict_policy.py`).
+
+One export defect had to be fixed to get any counter out at all: `LLMResult`
+(`psla_config.py:36`) is a **pydantic** dataclass, so `export_result`'s
+`LLMResult(**mooncake_stats)` silently **drops** keys the schema does not
+declare. Declaring the new fields would have put null-valued keys in every stock
+result, so they are merged into `result_dict` after `asdict()` instead
+(`util/results.py`), leaving stock output untouched.
+
+## STEP 3/4 — the runs
+
+Config (b) only (`memory_media=dram`, `admission_write_policy=write_through`,
+`demote_policy=always`). Conservation checks pass in all eight runs:
+`demoted + dropped == memory evictions`, `ssd_eviction_count = 0`, `notdone = 0`,
+`preemption_count = 0`, `recomputation_count = 0`.
+
+### Conversation
+
+| point | policy | batch/sched | peak HBM | evict blocks (cap / re-key) | key already in store | key absent | puts refresh-only / wrote bytes | **HBF B/req** | HBF wr ops/req | PCM B/req | hit rate | reuse hit blk | eff. prefill tok |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cap 8 | stock | 3.942 | 24.96% | 3,387,012 / **0** | 3,297,468 | 89,544 | — | **3,377,115,693** | 1,288.3 | 1,725,838,131 | 0.1647 | 672,089 | 54,577,535 |
+| cap 8 | **on_evict** | 3.944 | 24.96% | 3,387,012 / **0** | 3,300,607 | 86,405 | 3,300,607 / **86,405** | **3,467,550,130** | 1,322.8 | 1,771,055,350 | 0.1658 | 676,796 | 54,502,223 |
+| cap 256 | stock | 43.609 | 99.19% | 3,443,404 / **0** | 3,364,388 | 79,016 | — | **3,387,654,930** | 1,292.3 | 1,731,107,750 | 0.1631 | 665,419 | 54,684,255 |
+| cap 256 | **on_evict** | 43.693 | 99.19% | 3,443,404 / **0** | 3,366,372 | 77,032 | 3,366,372 / **77,032** | **3,467,556,422** | 1,322.8 | 1,771,058,495 | 0.1638 | 668,491 | 54,635,103 |
+
+### Tool&Agent
+
+| point | policy | batch/sched | peak HBM | evict blocks (cap / re-key) | key already in store | key absent | puts refresh-only / wrote bytes | **HBF B/req** | HBF wr ops/req | PCM B/req | hit rate | reuse hit blk | eff. prefill tok |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cap 8 | stock | 3.901 | 29.54% | 1,536,486 / **0** | 1,506,434 | 30,052 | — | **1,696,587,055** | 647.2 | 885,573,812 | 0.4037 | 1,174,113 | 27,788,891 |
+| cap 8 | **on_evict** | 3.893 | 29.54% | 1,536,486 / **0** | 1,506,562 | 29,924 | 1,506,562 / **29,924** | **1,727,931,089** | 659.2 | 901,245,829 | 0.4040 | 1,174,945 | 27,775,579 |
+| cap 96 | stock | 43.031 | 99.14% | 1,558,264 / **0** | 1,512,237 | 46,027 | — | **1,678,879,752** | 640.4 | 876,720,161 | 0.4020 | 1,169,287 | 27,866,107 |
+| cap 96 | **on_evict** | 42.775 | 99.14% | 1,558,264 / **0** | 1,512,621 | 45,643 | 1,512,621 / **45,643** | **1,726,739,907** | 658.7 | 900,650,238 | 0.4022 | 1,169,959 | 27,855,355 |
+
+### The decision rule
+
+| | HBF B/req, high batch vs low batch | verdict |
+|---|---|---|
+| **Conversation, `on_evict`** | 3,467,550,130 → 3,467,556,422 = **+0.00%** | < 5% |
+| **Tool&Agent, `on_evict`** | 1,727,931,089 → 1,726,739,907 = **−0.07%** | < 5% |
+
+**Both traces are under 5%. The hypothesis is dead.** Routing HBM evictions into
+the store does **not** make far-tier write volume depend on HBM occupancy. It is
+not a small effect that needs a longer run or a wider sweep; it is **zero to
+three significant figures on one trace and negative on the other**, across an
+11× batch range that drives peak HBM occupancy from 25% to 99.2%.
+
+On_evict against stock at each point, for completeness:
+
+| point | HBF B/req, on_evict vs stock |
+|---|---|
+| Conversation cap 8 | +2.68% |
+| Conversation cap 256 | +2.36% |
+| Tool&Agent cap 8 | +1.85% |
+| Tool&Agent cap 96 | +2.85% |
+
+### Why it is flat — the mechanism, now measured
+
+**Eviction volume itself barely moves with batch.** Over the same 11× batch
+range: Conversation 3,387,012 → 3,443,404 evicted blocks (**+1.66%**),
+Tool&Agent 1,536,486 → 1,558,264 (**+1.42%**). The reason is
+`BlockPool.pop_free_block`: `_next_fresh` counts blocks **ever** handed out, not
+blocks currently held. Once 78,643 ids have been touched — which happens early
+at every batch size — every further allocation comes from the free queue, and the
+eviction rate tracks *total allocations*, i.e. the workload's block footprint,
+not instantaneous occupancy. HBM occupancy changes **how long** a block sits
+before eviction, not **how many** blocks are evicted.
+
+**And 97.4–98.0% of those evictions are duplicates.** Under config (b) nothing
+leaves `store.objects`, so almost every evicted block's key is still there and
+its put is an LRU refresh costing zero bytes. The write increase comes entirely
+from the 2.0–3.0% whose save was skipped by the `_aligned` load/save exclusion.
+
+The accounting closes: the extra bytes are exactly the hook's own writes.
+
+| point | Δ(HBF + PCM write bytes), on_evict − stock | `hbm_evict_write_bytes` |
+|---|---|---|
+| Conversation cap 8 | 678,258,278,400 | 679,516,569,600 |
+| Conversation cap 256 | 599,261,184,000 | 605,804,298,240 |
+| Tool&Agent cap 8 | 235,080,253,440 | 235,331,911,680 |
+| Tool&Agent cap 96 | 358,951,157,760 | **358,951,157,760** (exact) |
+
+The 0.2–1.1% residuals are second-order: the extra write stalls shift the
+schedule slightly, which changes the prefill-save stream a little.
+
+### Confounds, all flagged
+
+1. **Achieved batch does move, slightly, and not in one direction.** Conversation
+   **+0.04%** (cap 8) and **+0.19%** (cap 256); Tool&Agent **−0.21%** (cap 8) and
+   **−0.59%** (cap 96). The largest is Tool&Agent cap 96. All are an order of
+   magnitude smaller than the 5% threshold and could not hide an occupancy
+   effect, but they are a real mismatch between the stock and `on_evict` arms.
+2. **Latency and throughput deltas are contaminated and must not be read as a
+   performance result.** Throughput falls 1.2–2.4% under `on_evict`
+   (Conversation 19,439 → 19,202 and 25,698 → 25,348 tok/s; Tool&Agent
+   26,468 → 26,177 and 36,280 → 35,409), and mean e2e rises 0.5–1.2%. That is
+   queueing feedback from the extra `save_wait` the hook charges (+175.2 s,
+   +156.2 s, +60.7 s, +92.5 s of simulated time), not a property of the memory
+   hierarchy. The far tier still has **no shared-bandwidth model**, so no day
+   count or lifetime is quoted anywhere in this phase.
+3. **Duplicate-key writes dominate the hook's traffic** — by design, and reported
+   rather than suppressed. The `refresh-only / wrote bytes` split is the honest
+   version of "how much of this hook is real".
+4. **Peak HBM occupancy is identical between the two arms** at every point
+   (24.96 / 99.19 / 29.54 / 99.14), so the two arms really are being compared at
+   the same occupancy.
+
+### What this does and does not settle
+
+- **Settled:** prompt-block HBM eviction is not a channel by which HBM pressure
+  reaches the far tier, even when it is wired directly into the store. PHASE 9
+  STEP 4's flat curve is **not** an artefact of the missing hook.
+- **Not settled, and untouched:** generated/transient KV. It has no key space, so
+  it cannot enter the store at all, and — per STEP 0(b) — it cannot reach this
+  hook either. The thesis subject remains unmeasured, exactly as the SCOPE
+  STATEMENT above says.
+- **Follow-up not built, as instructed:** the shared-key lower-bound variant of
+  the hook.
+
+## STEP C — option 2 feasibility (trace analysis only, no simulator change)
+
+Does generated KV actually get re-read? Measured on the **raw 512-token hash
+ids**. A request `R` with ≥ 2 ids has stem `R.hash_ids[:-1]` — the last id
+usually covers a partial block that grows as the request generates — and a later
+request `L` *continues* `R` when `L.hash_ids[:len(stem)] == stem`. Script:
+`scripts/phase12/stepc.py`. No simulator was started.
+
+| | window | (1) requests continued by a later request | (2) gap to first continuation, p50 / p90 / mean | extra 512-tok hashes past the stem, p50 / p90 / mean | `ceil(output_length/512)`, p50 / p90 / mean | extra ÷ expected, p50 / mean |
+|---|---|---|---|---|---|---|
+| **Conversation** | W = 5,000 | **2,001 / 5,000 = 40.02%** | **72.0 / 366.0 / 130.4 s** | 2 / 28 / 10.46 | 1 / 2 / 1.23 | 2.00 / 9.49 |
+| | full (12,031) | **5,287 / 12,031 = 43.94%** | 78.0 / 411.0 / 158.0 s | 2 / 23 / 9.18 | 1 / 2 / 1.22 | 2.00 / 8.37 |
+| **Tool&Agent** | W = 5,000 | **2,012 / 5,000 = 40.24%** | **0.0 / 171.0 / 49.5 s** | 2 / 10 / 5.51 | 1 / 1 / 1.11 | 2.00 / 5.08 |
+| | full (23,608) | **10,413 / 23,608 = 44.11%** | 0.0 / 234.0 / 70.7 s | 2 / 10 / 5.16 | 1 / 2 / 1.11 | 2.00 / 4.76 |
+
+Three observations, no conclusions drawn:
+
+1. **Roughly 40% of requests are continued by a later one**, on both traces. The
+   W = 5,000 window costs about **4 percentage points** against the full trace
+   (40.02% vs 43.94%; 40.24% vs 44.11%) — the truncation is a modest
+   underestimate, not a structural one.
+2. **The gaps are long, and are the same order as the residencies already
+   recorded.** Conversation p50 **72 s**, p90 366 s. PHASE 9 STEP 3 measured mean
+   PCM residency of 109.17 s (b) / 77.36 s (c) / 38.85 s (d) at this pool size,
+   so a continuation-driven reuse would land inside the (b)/(c) residency window
+   and outside (d)'s. Tool&Agent's p50 gap is **0.0 s** — continuations arrive in
+   the same trace millisecond, which is a much easier target.
+3. **The continuation carries about twice as much new prompt as the previous
+   output could explain** (extra ÷ expected p50 = **2.00** on both traces, mean
+   4.8–9.5). So a continuation's prompt is not just "previous prompt + previous
+   output": it contains substantial fresh user/tool input. **Storing generated KV
+   would therefore capture only a fraction of what the continuation re-reads**,
+   and the mean ratio is heavily skewed by long-tail turns. That fraction is what
+   an option-2 hook would have to justify itself on; it is not estimated here.
+
+## Settings and provenance
+
+| | |
+|---|---|
+| base commit compared against | **`4e9b9fe`** |
+| this phase's commit | **`b4cc8f1`** (code, tests, harness, entry) on `falsifier-on-evict`, not merged |
+| trace files on this machine | `tmp/phase12/` (gitignored), md5 sums above |
+| hardware | `H3-B200-KVONLY`, `data/hardware/hardware_models_h3b200.json` (md5 `9b4cba823dd4158d9bd3efe16bf74491`), unchanged |
+| cluster | `data/clusters/8_b200_h3/h8_tp2dp4.json`, 8 workers, TP2/DP4 |
+| model | `LLaMa2-70B-GQA` — Nhead 64, KV heads 8 (Grouped_Num 8), Nlayer 80, Dmodel 8192, head_dim 128 |
+| KV precision | **FP16**, hardcoded (`cache_config.py`), the conservative choice |
+| KV bytes/token, block bytes | 163,840 B/token at TP2; **2,621,440 B** per 16-token block |
+| HBM per rank | 192 GiB = **78,643 blocks** (pre-compensated `Capacity`, the documented workaround) |
+| PCM / memory pool | **142,213 blocks = 347.2 GiB** (43.4 GiB/GPU × 8) — the design configuration |
+| HBF / offload pool | **10,066,329 blocks = 24 TiB** (3 TiB/GPU × 8) |
+| HBF timings | read 0.1 µs / 7451 GiB/s (**perfect-prefetch upper bound**, not measured); write 200 µs / 3.0 GB/s |
+| workload | Mooncake FAST'25 conversational and Tool&Agent traces — **stand-ins for CAG**, not the target workload |
+| W, offered load, seed | 5,000 requests, 30 QPS (`--trace_target_qps 30`), `--random_seed 0` |
+| harness | `scripts/phase12/{build_trace.py,run_one.py,step3.sh,stepc.py,stepc_tokens.py,audit_export.py,llama-70b-gqa.json}` |
+
+**No hardware number was invented or changed in this phase.** Every value above
+is either read from the tracked files or carried over unchanged from PHASE 9/10.
+Trace files are not committed (33 MB / 21 MB); their md5 sums are above and
+`scripts/phase12/README.md` gives the source URLs.
+
+---
+
+# PHASE 12 (addendum) — STEP C redone in tokens, and an export audit
+
+Appended after the PHASE 12 verdict; it does not change it. Trace analysis only
+— **no simulator was started for any number in this section.**
+
+## STEP 1a — continuations measured in tokens
+
+Same match rule as STEP C, on the raw 512-token hash ids: request `R` with ≥ 2
+ids has stem `R.hash_ids[:-1]`, and the first later `R'` whose ids start with
+that stem is its continuation. Now measured as
+`delta = R'.input_length − R.input_length` against `R.output_length`.
+Script: `scripts/phase12/stepc_tokens.py`.
+
+`R.output_length == 0` never occurs in either trace, so no pair is excluded and
+every ratio below is defined.
+
+### Conversation
+
+| | continued | `delta` (tokens) p10 / p50 / p90 / mean | **`delta / R.output_length`** p10 / p50 / p90 | **`delta ≥ out`** | **`delta < out`** | of which `delta < 0` |
+|---|---|---|---|---|---|---|
+| W = 5,000 | 2,001 / 5,000 | 62 / 598 / 13,809 / 4,799.4 | **0.970 / 1.486 / 82.599** | **1,755 = 87.71%** | **246 = 12.29%** | 43 = 2.15% |
+| full (12,031) | 5,287 / 12,031 | 64 / 563 / 11,259 / 4,150.0 | **0.977 / 1.450 / 79.870** | **4,661 = 88.16%** | **626 = 11.84%** | 103 = 1.95% |
+
+### Tool&Agent
+
+| | continued | `delta` (tokens) p10 / p50 / p90 / mean | **`delta / R.output_length`** p10 / p50 / p90 | **`delta ≥ out`** | **`delta < out`** | of which `delta < 0` |
+|---|---|---|---|---|---|---|
+| W = 5,000 | 2,012 / 5,000 | −18 / 443 / 4,416 / 2,302.4 | **−2.333 / 6.364 / 199.000** | **1,553 = 77.19%** | **459 = 22.81%** | 290 = 14.41% |
+| full (23,608) | 10,413 / 23,608 | −11 / 444 / 4,647 / 2,118.0 | **−0.667 / 5.308 / 203.809** | **8,206 = 78.81%** | **2,207 = 21.19%** | 1,330 = 12.77% |
+
+### What this says, and what it does not
+
+**The assumption, stated plainly: the trace cannot show that `delta` begins with
+`R`'s output.** It records only lengths and chunk hashes — no token content. So
+"the continuation contains the previous output" is an **assumption**, not a
+measurement, and every figure above is consistent with a continuation whose
+extra tokens are entirely unrelated to `R`'s output.
+
+Given that, three things are counted rather than dropped:
+
+1. **`delta < R.output_length` in 12.29% (Conversation) and 22.81% (Tool&Agent)
+   of continuations** — W = 5,000; 11.84% and 21.19% on the full traces. For
+   these, the continuation's prompt grew by **less** than the previous output.
+   **These directly contradict "the continuation contains the whole output."**
+   They cannot be explained by a continuation that appends the output verbatim.
+2. **`delta < 0` in 2.15% (Conversation) and 14.41% (Tool&Agent)** — the
+   continuation's prompt is *shorter* than the one it continues. Tool&Agent's
+   14.41% is large enough that it is a property of the workload, not noise:
+   agent turns evidently drop or rewrite earlier context. Under the p10 column
+   this shows as a **negative ratio** (−2.333 / −0.667).
+3. **Where `delta ≥ out` it is usually much larger than `out`.** Conversation
+   p50 ratio **1.486**, Tool&Agent p50 **6.364** — and both p90s are enormous
+   (82.6, 199.0). So even on the optimistic reading, the previous output is a
+   **minority of what the continuation adds**: at the median, roughly two thirds
+   of the delta on Conversation and five sixths on Tool&Agent is fresh input.
+
+Conversation's p10 ratio of **0.970** — just under 1 — is worth noting: the
+distribution has a visible mass *at* `delta ≈ out`, consistent with a plain
+"append the reply, ask a short follow-up" turn, which is what makes the
+assumption tempting. Tool&Agent has no such mass.
+
+**Bearing on option 2:** storing generated KV can, at best, serve the part of a
+continuation that is the previous output. These numbers bound that at well under
+half of the delta at the median on both traces, and at nothing at all for the
+12–23% of continuations whose delta is smaller than the output. That bound is
+not the same as the cost, which is in the design note.
+
+## STEP 1b — export audit: did the dropped-key defect ever hide a recorded number?
+
+**No. There are none.** The `LLMResult` defect fixed in PHASE 12
+(`util/results.py`) was latent: before PHASE 12 no stats builder produced a key
+the schema did not declare.
+
+Checked two ways, both exhaustive:
+
+1. **Statically**, over every stats builder `export_result` splats into
+   `LLMResult`:
+
+   | builder | keys | dropped |
+   |---|---|---|
+   | `ConnectorStats.as_dict` | 10 | **none** |
+   | `MooncakeStats.as_dict` (stock) | 42 | **none** |
+   | `MoEStats.as_dict` | 13 | **none** |
+   | `MooncakeStats.as_dict` (PHASE 12 counters on) | 56 | the 14 `hbm_evict_*` keys |
+
+2. **Dynamically**, by running a real simulation with `LLMResult` wrapped to
+   capture every keyword handed to it (`scripts/phase12/audit_export.py`;
+   it patches nothing in the tree). 124 keys offered, 110 declared, **14
+   dropped — all 14 of them `hbm_evict_*`**, i.e. introduced by PHASE 12 itself.
+
+So every counter quoted anywhere in PHASES 1–11 reached the result file. The
+defect was introduced-and-fixed within PHASE 12 and has no retroactive reach.
+
+## STEP 2 — option 2 design note
+
+Scoped in **`TokenSim/docs/option2-output-kv-scope.md`** — design only, nothing
+implemented, per instruction. Two measurements taken for that note belong here
+because they are trace facts, not design choices:
+
+| | Conversation | Tool&Agent |
+|---|---|---|
+| continuation pairs (W = 5,000) | 2,001 | 2,012 |
+| **`R`/`R'` sub-id chains diverge *before* `R`'s last full prompt block** | **1,958 = 97.9%** | **1,986 = 98.7%** |
+| size of that divergent tail, `p − s` (16-token blocks) — p50 / max | **22 / 32** | **14 / 32** |
+| `R.prefill_len` not a multiple of 16 (boundary block is mixed) | 1,861 = 93.0% | 1,892 = 94.0% |
+| `R` generates enough to fill that boundary block | 1,937 = 96.8% | **1,577 = 78.4%** |
+| output blocks wanted, `ceil(out/16)` — p50 / mean | 22 / 22.0 | 2 / 11.1 |
+| output blocks keyable from `R'` — p50 / mean | 38 / 300.9 | 29 / 146.2 |
+| **`R`'s whole output is keyable from `R'`** | **91.4%** | **81.6%** |
+
+The first row is the one that matters and it was not anticipated: **for ~98% of
+continuation pairs the two key chains diverge up to 32 blocks before the end of
+`R`'s prompt**, because the trace hashes at 512-token granularity while the
+simulator blocks at 16, so a partial trailing 512-token chunk gets a fresh id
+even where its leading tokens are identical. Since both `plan_reuse`
+(`kv_cache_manager.py:58-64`) and `store.lookup` (`store.py:79-93`) stop at the
+first miss, `R'` would never reach `R`'s stored output blocks at all unless that
+divergent tail is dealt with. The design note treats this as its central
+problem.
+
+---
+
+# PHASE 13 — Corrections, a limitation, and a tail-sharing sensitivity run
+
+Append-only: PHASE 12 is untouched; the correction below supersedes one sentence
+in it. **PHASE 9 remains the headline result.** Everything here is either a
+correction, a limitation, or a sensitivity check.
+
+## STEP 1a — CORRECTION to the PHASE 12 addendum
+
+The PHASE 12 addendum (STEP 1a) concluded:
+
+> "the previous output is a **minority** of what the continuation adds: at the
+> median, roughly two thirds of the delta on Conversation and five sixths on
+> Tool&Agent is fresh input."
+
+**That is wrong for Conversation, and the arithmetic was inverted.** The median
+ratio is `delta / R.output_length`, so the output's share of the delta is its
+**reciprocal**:
+
+| | median `delta / out` | **output's share of the added tokens** | |
+|---|---|---|---|
+| **Conversation** | 1.486 | **1 / 1.486 = 67.3%** | **a MAJORITY** |
+| **Tool&Agent** | 6.364 | **1 / 6.364 = 15.7%** | **a minority** |
+
+So at the median, on Conversation the previous output is **about two thirds of
+what the continuation adds**, not one third. Only Tool&Agent matches the
+original claim, at **~16%**.
+
+This changes the reading of option 2's *ceiling*: on Conversation a stored
+output block could serve a clear majority of a continuation's new prompt, which
+is a materially better case for the idea than PHASE 12 stated. It does **not**
+change anything else in PHASE 12 — no measured number moves, and the
+`delta < out` counts (12.29% Conversation, 22.81% Tool&Agent) and `delta < 0`
+counts (2.15%, 14.41%) stand as reported.
+
+## STEP 1b — generated KV as a share of all KV
+
+Every token carries the same KV bytes (`size_per_token` is a model/TP constant,
+`config/cache_config.py`), so the token share **is** the byte share. Trace
+analysis only; script `scripts/phase12/generated_share.py`.
+
+| | window | input tokens | output tokens | input mean / median | output mean / median / p90 | **generated share** |
+|---|---|---|---|---|---|---|
+| **Conversation** | W = 5,000 | 65,330,959 | 1,730,337 | 13,066.2 / 7,757 | 346.1 / 356 / 606 | **2.58%** |
+| | full (12,031) | 144,793,823 | 4,122,048 | 12,035.1 / 6,909 | 342.6 / 350 / 597 | **2.77%** |
+| **Tool&Agent** | W = 5,000 | 46,574,699 | 922,544 | 9,314.9 / 6,398 | 184.5 / 30 / 513 | **1.94%** |
+| | full (23,608) | 202,940,084 | 4,299,817 | 8,596.2 / 6,346 | 182.1 / 30 / 507 | **2.07%** |
+
+> **Upper bound: storing *all* generated KV could add at most 2.58%
+> (Conversation) and 1.94% (Tool&Agent) to the KV byte stream** at W = 5,000 —
+> 2.77% and 2.07% on the full traces.
+
+Two things this bound does and does not say:
+
+- It is an **upper** bound on the *addition*, taken against total KV tokens.
+  Measured instead against the store's actual write population — **distinct**
+  prompt blocks, after the 1.51× / 2.08× dedup — the same output volume is
+  **4.0%** and **4.1%** (108,146 output blocks against 2,695,220 distinct
+  prompt blocks; 57,659 against 1,397,479). Generated blocks cannot dedup, so
+  this second framing is the one that matches what the far tier would see.
+- Either way the conclusion is the same and it is worth stating plainly:
+  **generated KV is a small fraction of this workload.** These are prompt-heavy
+  traces — a 13,066-token mean prompt against a 346-token mean output on
+  Conversation, 9,315 against 185 on Tool&Agent. Option 2 cannot move the write
+  stream by more than a few percent on *these* traces whatever it does, and that
+  bound should be stated wherever option 2 is proposed or evaluated.
+
+## STEP 2 — LIMITATION: the prompt tail a continuation cannot reach
+
+**What it is.** The FAST'25 traces hash at **512 tokens**; the simulator blocks
+at **16**. For a continuation pair `(R, R')` the key chains agree only on
+sub-indices `[0, s)` with `s = 32·(len(R.raw_hash_ids) − 1)`, because the match
+rule excludes `R`'s last raw id — a partial chunk whose content grows. But `R`
+holds `p = R.input_length // 16` full prompt blocks, and `s < p` almost always.
+`R`'s blocks in `[s, p)` therefore carry sub-ids `R'` never asks for; and since
+both `plan_reuse` (`kv_cache_manager.py:58-64`) and `MooncakeStore.lookup`
+(`store.py:79-93`) stop at the **first** miss, everything after them is
+unreachable too.
+
+**How much**, at W = 5,000 (script `scripts/phase12/tail_divergence.py`):
+
+| | Conversation | Tool&Agent |
+|---|---|---|
+| continuation pairs | 2,001 | 2,012 |
+| **affected** (`s < p`) | **1,958 = 97.9%** | **1,986 = 98.7%** |
+| unreachable prompt blocks per affected pair — p50 / p90 / max | **22 / 28 / 32** | **14 / 28 / 32** |
+| total unreachable blocks | 36,422 | 27,226 |
+| as % of prompt-block instances in the window | 0.89% (of 4,080,885) | 0.94% (of 2,908,548) |
+| as % of distinct prompt blocks | **1.35%** (of 2,695,220) | **1.95%** (of 1,397,479) |
+
+**What it limits.** A real prefix cache keys 16-token blocks by token content, so
+those blocks would match automatically. The modelled workload therefore has
+**~1.4% / ~2.0% more distinct prompt blocks** than a content-addressed cache
+would see, which means:
+
+- **Prefix hit rate is understated** in every phase — every `prefix_cache_hit_rate`
+  and `reuse_hit_blocks` figure in PHASES 1–12 is a floor, not an estimate.
+- **Reuse retained (d vs b)** — 59.3% (Conversation) and 90.4% (Tool&Agent) at
+  the cap-48 setting — is measured against that understated base.
+- **The `if_read` hit-rate cost, −40.7% / −9.6%**, is measured on the same base
+  and inherits the same bias. STEP 4 below shows it is **sensitive** to it.
+
+**What it does not touch.** Every result that is a comparison *between configs
+at a fixed workload*: both arms see the same trace, the same keys and the same
+footprint, so the differences are unaffected in kind. Specifically, the PHASE 12
+falsifier verdict (+0.00% / −0.07%, a within-workload high-vs-low-batch
+comparison), the HBF write reductions between (b), (c) and (d), and the
+conservation identities. It also does not touch the byte counts as
+*measurements* — they are what that workload wrote — though STEP 4 shows the
+absolute values are workload-sensitive and so should not be read as
+characteristic of the architecture.
+
+## STEP 3 — tail-sharing as a trace option
+
+`build_trace.py` gains **`--share_partial_tail`, default OFF**. When on, each
+`R'` takes its predecessor `R`'s sub-ids across `R`'s last 512-token chunk, up
+to `floor(R.input_length / 16)`; positions beyond that keep `R'`'s own. The
+predecessor is chosen by the PHASE 12 match rule (longest stem wins, ties to the
+most recent) and only where `R'.input_length ≥ R.input_length`, so the 2.15% /
+14.41% of pairs with negative delta are never rewritten.
+
+**This is an ASSUMPTION, not a correction.** It presumes `R'`'s tokens match
+`R`'s up to `R`'s length, which the trace cannot show — the traces carry lengths
+and chunk hashes, no token content. The original files remain the reference
+workload.
+
+### Default OFF is byte-identical
+
+```
+ before:  5a19d814562e650fe6e44e4234a4793c  conv_5000.jsonl
+          c6cd3b0c8022eebb88358719a2596f1c  toolagent_5000.jsonl
+ rebuilt: 5a19d814562e650fe6e44e4234a4793c  (default off)
+          c6cd3b0c8022eebb88358719a2596f1c  (default off)
+```
+
+### What it changed, and how broad it is
+
+| | requests changed | sub-ids rewritten | new file md5 | distinct blocks (was) |
+|---|---|---|---|---|
+| Conversation | 4,904 / 5,000 | 109,166 | `13d05f75aaaae8669619ae88efbb4998` | **2,620,973** (2,695,220, **−2.75%**) |
+| Tool&Agent | 4,914 / 5,000 | 80,839 | `edcd7c1028738dff7c0228fd175ea399` | **1,332,772** (1,397,479, **−4.63%**) |
+
+**The rule as specified is far broader than the divergence it was meant to
+address, and this must be stated before its results are read.** 4,977 / 5,000
+(Conversation) and 4,959 / 5,000 (Tool&Agent) requests have *some* qualifying
+predecessor, because the longest-match rule accepts a stem of a single 512-token
+chunk — in practice the shared system prompt. On Conversation **70.8%** of
+chosen predecessors share exactly **one** chunk, and those pairs account for
+**79.6%** of all rewritten sub-ids (Tool&Agent: 32.6% and **49.2%**). For those
+pairs the trace evidences agreement on the first 512 tokens only, while the rule
+rewrites up to `R.input_length / 16` positions. That is a very strong assumption.
+
+Files: `conv_5000_tailshare.jsonl`, `toolagent_5000_tailshare.jsonl`; the
+originals are kept. Tests: **190 pass** (177 + 13 new in
+`tests/test_build_trace_tail_sharing.py`), covering default-off identity,
+negative-delta exclusion, the `input_length % 16 ≠ 0` boundary, longest-stem and
+most-recent tie-breaking, single-chunk ineligibility, and the fact that sharing
+**chains** through an already-rewritten predecessor.
+
+## STEP 4 — SENSITIVITY: configs (b) and (d) on the tailshare workload
+
+Configs (b) and (d) at the PHASE 9 STEP 3 batch-matched setting: cap 48, 30 QPS,
+W = 5,000, `memory_capacity_blocks = 142213`, `ssd_capacity_blocks = 10066329`,
+`charge_eviction_writes = ON`, `H3-B200-KVONLY`
+(md5 `9b4cba823dd4158d9bd3efe16bf74491`), `LLaMa2-70B-GQA` TP2/DP4, seed 0.
+8 runs: 4 on the tailshare files, 4 on the originals as the paired baseline.
+**No latency or day-count figure is quoted.**
+
+**The four original-trace runs reproduce PHASE 9 STEP 3 exactly**, config (d)
+included — which had not been re-measured before now:
+
+| | HBF write bytes | HBF blocks | hit rate | reuse hit blocks | batch/sched |
+|---|---|---|---|---|---|
+| (b) Conversation | 16,853,376,696,320 ✓ | 6,429,053 ✓ | 0.1643 ✓ | 670,585 ✓ | 23.167889 ✓ |
+| (d) Conversation | 209,508,106,240 ✓ | 79,921 ✓ | 0.0974 ✓ | 397,596 ✓ | 22.378200 ✓ |
+| (b) Tool&Agent | 8,483,936,665,600 ✓ | 3,236,365 ✓ | 0.4037 ✓ | 1,174,042 ✓ | 22.885048 ✓ |
+| (d) Tool&Agent | 85,844,295,680 ✓ | 32,747 ✓ | 0.3650 ✓ | 1,061,727 ✓ | 22.429517 ✓ |
+
+### Conversation
+
+| metric | (b) original | (d) original | (b) tailshare | (d) tailshare |
+|---|---|---|---|---|
+| prefix hit rate (block-level) | **0.1643** | 0.0974 | **0.1202** | 0.0869 |
+| reuse hit blocks | 670,585 | 397,596 | 490,322 | 354,571 |
+| **HBF bytes / request** | **3,370,675,339** | 41,901,621 | **3,620,584,554** | 15,721,300 |
+| PCM bytes / request | 1,722,617,954 | 1,987,125,969 | 1,847,572,562 | 1,980,261,466 |
+| achieved batch / scheduler | 23.1679 | 22.3782 | 23.2212 | 22.3953 |
+| peak HBM occupancy | 85.66% | 90.54% | 86.45% | 96.64% |
+| workload footprint (distinct blocks) | 2,695,220 | 2,695,220 | 2,620,973 | 2,620,973 |
+
+| derived | original | tailshare |
+|---|---|---|
+| reuse retained (d vs b) | 59.3% | **72.3%** |
+| **`if_read` hit-rate cost** | **−40.7%** | **−27.7%** |
+| HBF write reduction (d vs b) | 98.76% | 99.57% |
+| HBF lifetime ratio (work-normalized, b ÷ d) | **80.4×** | **230.3×** |
+
+### Tool&Agent
+
+| metric | (b) original | (d) original | (b) tailshare | (d) tailshare |
+|---|---|---|---|---|
+| prefix hit rate (block-level) | **0.4037** | 0.3650 | **0.3769** | 0.3643 |
+| reuse hit blocks | 1,174,042 | 1,061,727 | 1,096,087 | 1,059,578 |
+| **HBF bytes / request** | **1,696,787,333** | 17,168,859 | **1,814,623,158** | 8,518,107 |
+| PCM bytes / request | 885,673,951 | 1,001,932,194 | 944,591,864 | 990,484,365 |
+| achieved batch / scheduler | 22.8850 | 22.4295 | 22.9675 | 22.6307 |
+| peak HBM occupancy | 75.12% | 79.49% | 79.52% | 78.43% |
+| workload footprint (distinct blocks) | 1,397,479 | 1,397,479 | 1,332,772 | 1,332,772 |
+
+| derived | original | tailshare |
+|---|---|---|
+| reuse retained (d vs b) | 90.4% | **96.7%** |
+| **`if_read` hit-rate cost** | **−9.6%** | **−3.3%** |
+| HBF write reduction (d vs b) | 98.99% | 99.53% |
+| HBF lifetime ratio (work-normalized, b ÷ d) | **98.8×** | **213.0×** |
+
+### Batch mismatch — flagged
+
+| comparison | Conversation | Tool&Agent |
+|---|---|---|
+| (d) vs (b), original | −3.41% | −1.99% |
+| (d) vs (b), tailshare | −3.56% | −1.47% |
+| (b) tailshare vs (b) original | **+0.23%** | **+0.36%** |
+| (d) tailshare vs (d) original | **+0.08%** | **+0.90%** |
+
+The (d)-vs-(b) gap of 2–3.6% is the same one PHASE 9 recorded and is inherent to
+the configs. The **trace-variant** deltas are all under 1%, so the two workloads
+are being compared at effectively the same operating point; none of the shifts
+below can be attributed to batch.
+
+### Result: tail-sharing is not a fix — it makes the workload worse
+
+**Numbers first.** Against the original trace, on config (b):
+
+| | prefix hit rate | HBF bytes / request |
+|---|---|---|
+| Conversation | 0.1643 → 0.1202 = **−26.9%** | 3,370,675,339 → 3,620,584,554 = **+7.41%** |
+| Tool&Agent | 0.4037 → 0.3769 = **−6.6%** | 1,696,787,333 → 1,814,623,158 = **+6.94%** |
+
+**Tail-sharing lowered the hit rate and raised the write volume**, which is the
+opposite of what it was constructed to do, even though it *reduced* the distinct
+block footprint by 2.75% / 4.63%.
+
+The mechanism: distinct-block count is a **set** measure and does not capture
+chain structure, but a prefix cache needs a **contiguous** match from position 0.
+The rule picks each `R'`'s predecessor independently, so two siblings that
+previously shared an identical chain can be rewritten against *different*
+predecessors and diverge earlier than they did before. Fewer store hits then mean
+the `_aligned` load/save exclusion (`mooncake_store.py:131-137`) fires less
+often, more requests save, and write volume rises — which is exactly the +7%
+seen. The 79.6% / 49.2% of rewrites resting on a single shared 512-token chunk
+is where most of that damage comes from.
+
+**Conclusion, stated as a sensitivity result and nothing more:**
+
+1. **PHASE 9 stands as the headline.** The original traces remain the reference
+   workload; nothing here supersedes a PHASE 9 number.
+2. **`--share_partial_tail` as specified is not usable as a correction** for the
+   STEP 2 limitation. It is committed, default off, and its files are kept, but
+   its results should be read as "a different, worse workload", not "the same
+   workload with an artefact removed". A narrower rule — restricted to pairs with
+   a genuinely multi-chunk stem, and applied consistently across siblings — would
+   be needed to test the STEP 2 limitation properly.
+3. **The `if_read` hit-rate cost is the most workload-sensitive number in this
+   thesis.** It moves −40.7% → −27.7% (Conversation) and −9.6% → −3.3%
+   (Tool&Agent) under a trace variant that changes 2–5% of the footprint. It
+   should be quoted with that sensitivity attached, never as a constant.
+4. **The HBF lifetime ratio is even more sensitive** — 80.4× → 230.3× and
+   98.8× → 213.0× — because (d)'s HBF writes are near zero, so small absolute
+   changes move the ratio by a large factor. **Work-normalized bytes per request
+   is the robust figure; the ratio is not**, and PHASE 8/9's lifetime multipliers
+   should carry that caveat.
+
+### Settings
+
+| | |
+|---|---|
+| runs | `tmp/phase12/runs/p13_{b,d}_{conv,ta}_{or,ts}` (8) |
+| harness | `scripts/phase12/run_one.py`, `WORK=tmp/phase12` |
+| new scripts | `generated_share.py`, `tail_divergence.py`, `build_trace.py --share_partial_tail` |
+| tests | **190** (177 + 13) |
+| simulator change | **none** — no TokenSim source file was modified in PHASE 13 |

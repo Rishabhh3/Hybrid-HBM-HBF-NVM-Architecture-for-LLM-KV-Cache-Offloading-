@@ -85,6 +85,40 @@ class MooncakeStats:
     memory_read_bytes: int = 0
     memory_write_latency: float = 0.0
     memory_read_latency: float = 0.0
+    # HBM-eviction instrumentation (hbm_evict_save_policy != "prefill").
+    # Non-zero only when that policy is enabled, and omitted from as_dict()
+    # entirely when it is not, so stock output is unchanged.
+    #
+    # hbm_evict_reporting is 1 per reporting store; aggregate() sums it, so it
+    # is a count of reporting stores, tested only for being non-zero.
+    hbm_evict_reporting: int = 0
+    # Every call into KVCacheManager.evict, both reasons.
+    hbm_evict_calls: int = 0
+    # Calls from register_blocks re-keying a block (block_manager is not
+    # involved and HBM is not full): counted, never acted on.
+    hbm_evict_rekey_calls: int = 0
+    # Capacity-driven evictions only, from BlockAllocator.allocate.
+    hbm_evict_blocks: int = 0
+    hbm_evict_bytes: int = 0
+    hbm_evict_prompt_blocks: int = 0
+    hbm_evict_keyed_blocks: int = 0
+    # Expected to stay 0: a block with no key cannot reach the capacity site.
+    hbm_evict_unkeyed_blocks: int = 0
+    # Whether the evicted block's key was already in the store. "present" means
+    # the put is an LRU refresh costing no bytes (store.py _put_one); "absent"
+    # means it is a genuine new write.
+    hbm_evict_present_blocks: int = 0
+    hbm_evict_absent_blocks: int = 0
+    # Puts issued by the hook ("on_evict" only), split by what they cost, and
+    # the bytes and simulated time they spent. A refresh-only put is a key the
+    # store already had: store.py _put_one touches LRU and returns, so it moves
+    # no bytes. hbm_evict_write_bytes is read off the store's own write
+    # counters, so it includes any cascade eviction the put forced.
+    hbm_evict_puts: int = 0
+    hbm_evict_puts_refresh_only: int = 0
+    hbm_evict_puts_wrote_bytes: int = 0
+    hbm_evict_write_bytes: int = 0
+    hbm_evict_save_latency: float = 0.0
     pool_keys: list[str] = field(default_factory=list)
     offload_tiers: list[str] = field(default_factory=list)
     offload_profiles: list[dict[str, Any]] = field(default_factory=list)
@@ -180,6 +214,23 @@ class MooncakeStats:
     def record_offload_profile(self, profile: dict[str, Any]) -> None:
         self.offload_profiles.append(dict(profile))
 
+    HBM_EVICT_FIELDS = (
+        "hbm_evict_calls",
+        "hbm_evict_rekey_calls",
+        "hbm_evict_blocks",
+        "hbm_evict_bytes",
+        "hbm_evict_prompt_blocks",
+        "hbm_evict_keyed_blocks",
+        "hbm_evict_unkeyed_blocks",
+        "hbm_evict_present_blocks",
+        "hbm_evict_absent_blocks",
+        "hbm_evict_puts",
+        "hbm_evict_puts_refresh_only",
+        "hbm_evict_puts_wrote_bytes",
+        "hbm_evict_write_bytes",
+        "hbm_evict_save_latency",
+    )
+
     def as_dict(self) -> dict[str, Any]:
         bandwidth = 0.0
         if self.transfer_latency > 0:
@@ -193,7 +244,13 @@ class MooncakeStats:
                 continue
             seen_profiles.add(fingerprint)
             offload_profiles.append(profile)
+        hbm_evict = (
+            {name: getattr(self, name) for name in self.HBM_EVICT_FIELDS}
+            if self.hbm_evict_reporting
+            else {}
+        )
         return {
+            **hbm_evict,
             "mooncake_get_count": self.get_count,
             "mooncake_put_count": self.put_count,
             "mooncake_store_hit_count": self.store_hit_count,
