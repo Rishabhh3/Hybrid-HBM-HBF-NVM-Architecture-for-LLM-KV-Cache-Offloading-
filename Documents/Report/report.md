@@ -769,6 +769,39 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
 
 > **One LaTeX rewrite, after STEP 4.** Every item below is listed, not applied.
 
+- [ ] **FRAMING (2026-10-17). This supersedes "(c) as the primary result" in
+      the NEW HEADLINE item below.** Structure the abstract, contributions,
+      `sec:headline` and the Conclusion as three separately labelled claims.
+  1. **Measured, an identity (baseline characterisation, not a
+     contribution).**
+     - Write-through costs one extra HBF write per admitted block. Removing
+       it halves HBF writes whatever the HBF capacity.
+     - 8 runs: raw 50.22–50.25%, residue-adjusted 49.26–49.29%, finite vs
+       unlimited ≤ 0.01 pt.
+     - HBF evictions are immaterial (≤ 0.09% of HBF bytes, ≤ +0.11% hit
+       rate).
+     - Phrase it as "we quantify a structural cost in the baseline and
+       confirm it is capacity-independent". It is **not** a PCM-media effect,
+       and not a surprising finding.
+  2. **Argued, not measured — say explicitly that TokenSim does not support
+     it.**
+     - Durability under write-back, with the caveat that KV is recomputable,
+       so the loss is recomputation rather than correctness.
+     - In-package capacity per area. The DRAM comparison figure is OPEN.
+     - Add the sentence: *"A same-capacity volatile buffer would write
+       identical HBF bytes; the case for PCM rests on durability and
+       in-package density, not write volume."*
+  3. **Measured, the contribution: (d) read-gated demotion.**
+     - It drops 98.7–99.0% of (c)'s HBF writes.
+     - It keeps 53–54% / 88% of (b)'s reuse hits, **against 48% / 86% for no
+       store at all**, i.e. 9–15% of the store's reuse benefit. Always pair
+       the retention figure with the no-store figure.
+     - PCM serves 71–77% of (d)'s store-served tokens.
+     - Re-admission after an `if_read` drop is a share of PCM writes, N = 4
+       (see report.md).
+  - Retire every "(c) is the primary result" and "PCM halves flash writes"
+    phrasing.
+
 - [ ] **NEW HEADLINE (2026-10-12).** Spill-only + vLLM-style lookup + honest
       read bookkeeping, 43.4 GiB/GPU per_rank, cap 48.
   - Rewrite the abstract, contributions, `tab:headline`, `sec:headline` and
@@ -792,9 +825,8 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
       in front of HBF, serving 6.9% / 7.2% of (b)'s store-served tokens on full
       traces. Not "HBF only": retire that label wherever it appears.
 - [ ] **(c)'s halving is a write-policy identity** ((b) HBF = admissions +
-      demotions, (c) HBF = demotions). State the HBF capacity check result and
-      how (c) is framed (decision pending; see findings.md "HBF CAPACITY
-      CHECK").
+      demotions, (c) HBF = demotions). State the HBF capacity check result.
+      Framing decided 2026-10-17: see the FRAMING item above.
 - [ ] **Read path:** PCM or HBF serve directly into HBM. HBF hits are not
       re-admitted to PCM (`store.py:179-182`, `:234-237`).
 - [ ] **Architecture / method:** describe spill-only entry (HBM evicts → PCM),

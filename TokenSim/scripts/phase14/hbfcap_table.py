@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PHASE 14 HBF capacity check tables.
 
-    hbfcap_table.py WORK
+    hbfcap_table.py WORK [d]
 
 Finite HBF = hc_f_* (headline, admission counter on; must equal s4_* on every
 other key). Unlimited HBF = hc_u_* (SENSITIVITY, not a hardware value).
@@ -102,5 +102,31 @@ def main(work):
             print(f"| {label} | {r['adm']:,} | {shares} | {'ok' if sum(r['src']) == r['adm'] else 'MISMATCH'} |")
 
 
+def d_shares(work):
+    """(d) PCM admissions by source over N = 4 (hc_f_d + hc_f_d_j05_s{1,2,3}),
+    and a reproduction check of each against its STEP 4 run (s4_*)."""
+    skip = ("simulator_wall_time", "mooncake_pool_keys")
+    for tr in ("conv", "ta"):
+        print(f"\n#### {TRACE[tr]} — (d) PCM admissions by source, N = 4\n")
+        print("| run | PCM admissions | " + " | ".join(name for name, _ in SRC) + " | sum check | = s4 run on all other keys |")
+        print("|---|---|" + "---|" * len(SRC) + "---|---|")
+        shares = []
+        for s in ("", "_j05_s1", "_j05_s2", "_j05_s3"):
+            raw = load(work, f"hc_f_d{s}_{tr}")
+            ref = load(work, f"s4_d{s}_{tr}")
+            same = {k: v for k, v in raw.items() if k not in skip and not k.startswith("pcm_admit_")} == \
+                   {k: v for k, v in ref.items() if k not in skip}
+            r = m(raw)
+            shares.append([100 * v / r["adm"] for v in r["src"]])
+            cells = " | ".join(f"{v:,} ({100 * v / r['adm']:.2f}%)" for v in r["src"])
+            print(f"| {s or 'unjittered'} | {r['adm']:,} | {cells} | {'ok' if sum(r['src']) == r['adm'] else 'MISMATCH'} | {'yes' if same else 'NO'} |")
+        lo = [min(x[i] for x in shares) for i in range(len(SRC))]
+        hi = [max(x[i] for x in shares) for i in range(len(SRC))]
+        print("| **range (N = 4)** | | " + " | ".join(f"{a:.2f}% – {b:.2f}%" for a, b in zip(lo, hi)) + " | | |")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if sys.argv[2:] == ["d"]:
+        d_shares(sys.argv[1])
+    else:
+        main(sys.argv[1])

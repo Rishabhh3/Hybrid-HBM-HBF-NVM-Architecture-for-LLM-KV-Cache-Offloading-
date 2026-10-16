@@ -8223,3 +8223,136 @@ holds exactly in all 4 unlimited runs as well.
     writes, was close to the direct measurement.
   - The direct measurement is **10.46% / 9.77%** (unjittered (d)).
   - The dedicated counter is now the number to quote.
+
+## HBF capacity — per rank or pool? (settled 2026-10-17, before any endurance figure)
+
+**5,033,164 is the POOL across the 4 writing ranks. Under `per_rank` the code
+splits it 4 ways, exactly as it splits PCM.**
+
+| | value | source |
+|---|---|---|
+| configured | `ssd_capacity_blocks = 5,033,164` | headline run config: `scripts/phase14/step4_schedule.py:23`, `scripts/phase14/hbfcap_schedule.py` (`HL`) |
+| read | `capacity_blocks = int(config.ssd_capacity_blocks)` | `TokenSim/mooncake/ssd.py:45` |
+| **split (`per_rank`)** | `pool = OffloadTier(config, block_bytes).capacity_blocks`; **`partition_capacity_blocks = pool // partitions`** = 5,033,164 // 4 = **1,258,291**, remainder 0. Each rank gets its own `OffloadTier` and LRU with that capacity | `ssd.py:157-158`; built with `partitions = store_partition_ranks = 4` at `store.py:98`. Counterpart of PCM's `memory_capacity_blocks // ranks` (`store.py:446`) |
+| no split (`global`, a variant) | one shared `OffloadTier` of 5,033,164 | `store.py` `else: self.offload = OffloadTier(config, ...)` |
+| **recorded in results** | **`partition_rank_ssd_capacity_blocks = 1,258,291`** in every `per_rank` run, next to `partition_rank_memory_capacity_blocks = 17,776` and `partition_ranks_seen = 4`. The offload profile records the pool knob (`ssd_capacity_blocks 5,033,164`, `store_partition per_rank`, `store_partition_ranks 4`). Unlimited-HBF runs record `hbf_capacity_configured_blocks = 5,033,164` (the pool) and the per-rank peak separately | `store.py:104-105`; e.g. `s4_d_ta` |
+
+Capacity in bytes, per writing rank (one TP-0 shard on one GPU), at
+2,621,440 B per block:
+
+- 1,258,291 × 2,621,440 = **3,298,534,359,040 B = 3 TiB − 524,288 B**. The
+  0.2-block shortfall comes from flooring 1,258,291.2.
+- Pool: 5,033,164 × 2,621,440 = **13,194,137,436,160 B = 11.999998 TiB**.
+
+**The 24 TiB figure.** Neither number is wrong; they measure different
+things, and no die count is involved.
+
+- **24 TiB = 8 GPUs × 3 TiB.** That is the physical HBF of the whole 8-GPU
+  cluster, including the 4 TP-1 GPUs. Their write stream mirrors TP-0 and is
+  not simulated (STEP 3a). This is the meaning of CLAUDE.md "the far tier is
+  24 TiB".
+- **12 TiB = 4 writing GPUs × 3 TiB.** That is the HBF that receives the
+  counted per-shard bytes, and it is the endurance budget for them (CLAUDE.md
+  "Endurance budget").
+- **3 TiB per writing GPU** = 1,258,291 blocks. This is the per-rank partition
+  the code actually enforces.
+
+**Where the 4× comes from.** The requests-to-wear-out intermediate must
+match the basis of B/req. B/req is pooled over every request served by all 4
+ranks, so it pairs with the 12 TiB pool. Pairing it with 3 TiB undercounts
+requests 4× (the "budget" factor). E_PCM below depends only on the capacity
+ratio. It is the same with per-rank capacities (1,258,291 : 17,776) or pool
+capacities (5,033,164 : 71,104), provided both sides use the same basis. Mixing
+the bases, e.g. 12 TiB HBF against 43.4 GiB PCM, gives a 4× error.
+
+## Break-even PCM endurance — per TP shard, full traces, headline configuration
+
+```
+E_PCM = (HBF_cap x 3000 / HBF_B_per_req) x PCM_B_per_req / PCM_cap
+HBF_cap = 1,258,291 x 2,621,440 = 3,298,534,359,040 B   (per writing rank)
+PCM_cap =    17,776 x 2,621,440 =    46,598,717,440 B   (per writing rank)
+HBF endurance 3000 P/E (TLC, CLAUDE.md NAND row)
+```
+
+E_PCM is the PCM endurance, in cycles, at which PCM and HBF exhaust their
+write budgets at the same time. **It is a threshold, not a lifetime and not a
+verdict.** No literature PCM endurance is compared here. Script:
+`scripts/phase14/breakeven_pcm.py`. Inputs: STEP 4 runs `s4_*`. The (d)
+counter reruns `hc_f_d*` reproduce them on every key except the added
+counters.
+
+**Assumptions (all optimistic; relaxing any of the first three raises the (d)
+threshold):**
+
+1. Perfect wear levelling in both tiers.
+2. HBF write amplification = 1.
+3. Every write is a full-block write at both tiers.
+4. Each writing rank's PCM:HBF write ratio equals the pooled ratio. Per-rank
+   write counts are not recorded; this is not measured.
+
+Notes:
+
+- Published chip-level PCM endurance already absorbs some cell variability, so
+  any comparison must not apply a further levelling penalty on top of it. That
+  would double-count.
+- HBF also holds the model weights (60.38 GiB per rank, the pre-compensation in
+  `Capacity`), while the simulator gives KV the whole 3 TiB. Under assumption 1
+  static data rotates too, so the write budget is the full capacity. Without
+  static wear levelling the HBF budget would be ~2% smaller.
+
+### Results
+
+#### Conversation
+
+| config | run | HBF B/req | PCM B/req | requests to HBF exhaustion (pool) | **E_PCM (cycles)** | E_PCM, residue spilled, never demoted | E_PCM, residue spilled, demoted at the config's own rate | demotion rate |
+|---|---|---|---|---|---|---|---|---|
+| (b) | unjittered | 3,036,078,553 | 1,525,785,718 | 13,037,348 | **106,720.7** | 110,889.5 | 106,700.3 | 1.0000 |
+| (c) | unjittered | 1,511,160,257 | 1,526,653,140 | 26,193,392 | **214,535.0** | 222,775.9 | 214,453.7 | 1.0000 |
+| (d) | unjittered | 14,628,947 | 1,705,810,947 | 2,705,759,518 | **24,762,023.8** | 25,734,060.9 | 24,753,454.0 | 0.0087 |
+| (d) | _j05_s1 | 15,856,106 | 1,704,020,759 | 2,496,351,407 | **22,821,629.3** | 23,719,799.9 | 22,813,703.1 | 0.0094 |
+| (d) | _j05_s2 | 16,642,690 | 1,702,763,967 | 2,378,366,194 | **21,726,972.7** | 22,588,831.8 | 21,719,363.6 | 0.0099 |
+| (d) | _j05_s3 | 14,981,929 | 1,705,248,790 | 2,642,010,330 | **24,170,648.7** | 25,120,015.7 | 24,162,276.1 | 0.0089 |
+
+(d) E_PCM range N = 4: 21,726,973 – 24,762,024; (d)/(c) threshold ratio 101.27 – 115.42; sanity check (E_d/E_c == HBF_c/HBF_d x PCM_d/PCM_c): holds in all 4 to 1e-12
+
+#### Tool&Agent
+
+| config | run | HBF B/req | PCM B/req | requests to HBF exhaustion (pool) | **E_PCM (cycles)** | E_PCM, residue spilled, never demoted | E_PCM, residue spilled, demoted at the config's own rate | demotion rate |
+|---|---|---|---|---|---|---|---|---|
+| (b) | unjittered | 1,466,116,938 | 737,006,175 | 26,998,128 | **106,750.7** | 111,092.3 | 106,728.3 | 1.0000 |
+| (c) | unjittered | 729,379,925 | 737,275,336 | 54,268,579 | **214,656.6** | 223,305.2 | 214,566.6 | 1.0000 |
+| (d) | unjittered | 9,627,307 | 816,065,665 | 4,111,472,845 | **18,000,666.1** | 18,741,274.6 | 17,993,719.4 | 0.0119 |
+| (d) | _j05_s1 | 9,769,217 | 815,437,621 | 4,051,748,794 | **17,725,532.9** | 18,458,178.2 | 17,718,656.7 | 0.0121 |
+| (d) | _j05_s2 | 9,413,444 | 815,238,081 | 4,204,881,240 | **18,390,953.1** | 19,152,174.9 | 18,383,807.4 | 0.0117 |
+| (d) | _j05_s3 | 9,319,615 | 815,592,078 | 4,247,215,622 | **18,584,177.9** | 19,351,234.2 | 18,576,979.7 | 0.0115 |
+
+(d) E_PCM range N = 4: 17,725,533 – 18,584,178; (d)/(c) threshold ratio 82.58 – 86.58; sanity check (E_d/E_c == HBF_c/HBF_d x PCM_d/PCM_c): holds in all 4 to 1e-12
+
+| | Conv | T&A |
+|---|---|---|
+| **(b)** (DRAM buffer, read as PCM) | **106,721** | **106,751** |
+| **(c)** | **214,535** | **214,657** |
+| **(d), range over N = 4** | **21.73 M – 24.76 M** | **17.73 M – 18.58 M** |
+| (d) ÷ (c) | 101.3 – 115.4 | 82.6 – 86.6 |
+
+(b)'s figure treats its write-through DRAM buffer as if it were PCM. It is the
+threshold PCM would need in (b)'s position. (b) has no PCM.
+
+**Sanity check: passes in all 8 (d) runs, to 1e-12.** The check is that
+E_d / E_c = (HBF_c / HBF_d) × (PCM_d / PCM_c). The capacities cancel, so the
+check is an algebraic identity: it verifies the arithmetic, not the inputs.
+For example, Conv unjittered: (1,511,160,257 / 14,628,947) ×
+(1,705,810,947 / 1,526,653,140) = 103.30 × 1.1174 = 115.42, which equals
+24,762,024 / 214,535.
+
+**End-of-run HBM residue.** On the full traces the residue is 3.70–3.97% of
+would-be admissions. The 8.2–17% figure is the W = 5,000 residue. It does
+**not** simply nudge both thresholds up; the direction depends on where the
+residue would go:
+
+- **If it were spilled and then demoted at each config's own measured rate**
+  (1 under `always`, 0.009–0.012 under `if_read`), every threshold moves by
+  **−0.02% to −0.04%**, i.e. essentially unchanged. The extra HBF writes scale
+  with the extra PCM writes.
+- **If it were spilled and never demoted** (upper bound), every threshold rises
+  by **+3.8% to +4.1%**.
