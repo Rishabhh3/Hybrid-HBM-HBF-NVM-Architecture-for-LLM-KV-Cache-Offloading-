@@ -16,6 +16,9 @@ class MooncakeService:
         self.block_bytes = block_bytes
         self.store = MooncakeStore(config, block_bytes)
         self.transfer_engine = TransferEngineSimulator(config)
+        # HBM admission-to-first-spill delays from every worker's connector
+        # (hbm_evict_save_policy != "prefill" only).
+        self.hbm_first_spill_delays: list[float] = []
 
 
 _SERVICES: dict[tuple[str, str], MooncakeService] = {}

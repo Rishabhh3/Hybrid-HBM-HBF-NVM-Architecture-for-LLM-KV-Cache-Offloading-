@@ -28,10 +28,12 @@ class BatchTransfer:
     parallel_paths: int = 1
     topology: str = "local"
     kind: str = "transfer"
+    # store_timing_mode == "free": the transfer moves its bytes in zero time.
+    free: bool = False
 
     @property
     def latency(self) -> float:
-        if self.bytes <= 0:
+        if self.bytes <= 0 or self.free:
             return 0.0
         bandwidth = max(1e-9, self.bandwidth_gbps * max(1, self.parallel_paths))
         return self.fixed_latency + self.bytes / _GB / bandwidth
@@ -83,6 +85,7 @@ class TransferEngineSimulator:
             parallel_paths=max(self.config.parallel_paths, self.config.num_nics),
             topology=topology,
             kind=kind,
+            free=self.config.store_timing_mode == "free",
         )
 
     def submit(

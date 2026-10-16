@@ -126,6 +126,13 @@ def get_moe_stats(engine: LLMEngine) -> dict[str, Any]:
 def get_mooncake_stats(engine: LLMEngine) -> dict[str, Any]:
     aggregate = MooncakeStats()
     seen_stats: set[int] = set()
+    # End-of-run counters (e.g. HBM residue) must be in place before any
+    # stats object is aggregated; a no-op under the stock configuration.
+    for worker in getattr(engine, "workers", []):
+        for connector in _flatten_connectors(getattr(worker, "connector", None)):
+            finalize = getattr(connector, "finalize_run_stats", None)
+            if finalize is not None:
+                finalize()
     for worker in getattr(engine, "workers", []):
         for connector in _flatten_connectors(getattr(worker, "connector", None)):
             stats = getattr(connector, "mooncake_stats", None)
@@ -396,6 +403,18 @@ def get_batch_stats(engine: LLMEngine, duration: float) -> dict[str, Any]:
     }
 
 
+# Prefixes of optional Mooncake counters merged into the result after asdict().
+OPTIONAL_MOONCAKE_KEY_PREFIXES = (
+    "hbm_evict_",
+    "save_skip_",
+    "partition_",
+    "hbf_readback_",
+    "if_read_gate_",
+    "pcm_admit_",
+    "hbf_capacity_",
+)
+
+
 def export_result(
     args: Any,
     g_time: LLMTime,
@@ -463,14 +482,14 @@ def export_result(
 
     result_dict = asdict(result)
     # LLMResult is a pydantic dataclass: keys it does not declare are dropped
-    # silently. The HBM-eviction counters are optional -- absent entirely under
-    # the stock hbm_evict_save_policy -- so they are merged in here rather than
-    # declared, which would add null-valued keys to every stock result.
+    # silently. The HBM-eviction and save-skip counters are optional -- absent
+    # entirely unless their flag is set -- so they are merged in here rather
+    # than declared, which would add null-valued keys to every stock result.
     result_dict.update(
         {
             name: value
             for name, value in mooncake_stats.items()
-            if name.startswith("hbm_evict_")
+            if name.startswith(OPTIONAL_MOONCAKE_KEY_PREFIXES)
         }
     )
     result_dict["cluster"] = asdict(result.cluster)

@@ -49,6 +49,9 @@ class KVCacheManager:
         # while the block still carries its key. None (stock) means HBM
         # eviction stays invisible to everything outside this class.
         self.evict_observer = None
+        # Optional hook fired for every (block, key) registered into the prefix
+        # cache. None (stock) keeps it inert.
+        self.register_observer = None
         self._cache: dict[PrefixCacheKey, PhysicalTokenBlock] = {}
         self._access_counter = 0
         # plan_reuse() runs for the waiting-queue head on every scheduling
@@ -104,6 +107,8 @@ class KVCacheManager:
             block.cached = True
             self._cache[key] = block
             self.touch(block)
+            if self.register_observer is not None:
+                self.register_observer(block, key)
 
     def register_output_blocks(self, req: Request, blocks: list[PhysicalTokenBlock]) -> None:
         if not req.output_hash_ids:
@@ -158,6 +163,14 @@ class KVCacheManager:
             free_queue.append_unique(block)
         else:
             free_queue.append_lru(block)
+
+    def set_register_observer(self, observer) -> None:
+        """Install the hook called for each block :meth:`register_blocks` keys."""
+        self.register_observer = observer
+
+    def cached_keys(self) -> list[PrefixCacheKey]:
+        """Keys of every block still resident in the GPU prefix cache."""
+        return list(self._cache)
 
     def set_evict_observer(self, observer) -> None:
         """Install the hook called by :meth:`evict`; None disables it."""

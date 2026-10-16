@@ -108,7 +108,9 @@ what cost.
 
 \paragraph{Contributions}
 \begin{itemize}
-  \item A concrete PCM tier derived from published die parameters
+  \item A concrete PCM tier sized from the first-generation 3D XPoint density
+        of \SI{0.62}{\giga\bit\per\milli\meter\squared}
+        reported by Ehrmann \emph{et al.}~\cite{ehrmann2022pcm}
         (\SI{43.4}{\gibi\byte} per GPU) that stacks vertically on the existing
         HBF stacks and consumes no HBF capacity (\S\ref{sec:arch}).
   \item A measurement of what write-absorption policy buys at that capacity:
@@ -204,8 +206,9 @@ HBF   & \SI{3}{\tera\byte} & \SI{8}{\tera\byte\per\second} & offload tier \\
 \subsection{Placement and capacity of the PCM tier}
 We place two PCM dies on top of each HBF stack, \emph{within the existing stack
 footprint}. PCM does not displace NAND dies laterally and therefore does not
-reduce HBF capacity. At \SI{35}{\milli\meter\squared} per die and a density of
-\SI{0.62}{\giga\bit\per\milli\meter\squared}:
+reduce HBF capacity. At \SI{35}{\milli\meter\squared} per die and the
+first-generation 3D XPoint density of
+\SI{0.62}{\giga\bit\per\milli\meter\squared}~\cite{ehrmann2022pcm}:
 \begin{align}
 2 \times 35 \times 0.62 &= \SI{43.4}{\giga\bit} \text{ per stack} \nonumber\\
                         &= \SI{5.43}{\gibi\byte} \text{ per stack} \nonumber\\
@@ -654,6 +657,20 @@ A. Tavakkol, J. G\'{o}mez-Luna, M. Sadrosadati, S. Ghose, and O. Mutlu,
 ``MQSim: a framework for enabling realistic studies of modern multi-queue SSD
 devices,''
 in \emph{Proc. USENIX FAST}, 2018.
+
+\bibitem{ehrmann2022pcm}
+A.~Ehrmann, T.~Blachowicz, G.~Ehrmann, and T.~Grethe,
+``Recent developments in phase-change memory,''
+\emph{Applied Research}, vol.~1, no.~4, p.~e202200024, 2022,
+doi:10.1002/appl.202200024.
+% BibTeX, verbatim (the paper uses thebibliography; kept for a .bib switch):
+% @article{ehrmann2022pcm,
+%   author  = {Ehrmann, Andrea and Blachowicz, Tomasz and Ehrmann, Guido and Grethe, Thomas},
+%   title   = {Recent developments in phase-change memory},
+%   journal = {Applied Research}, year = {2022}, volume = {1}, number = {4},
+%   pages   = {e202200024}, doi = {10.1002/appl.202200024}}
+% Gives 0.62 Gb/mm^2 for 20 nm (first-generation) Optane / 3D XPoint, taken
+% from TechInsights (its ref. [127]).
 
 \end{thebibliography}
 

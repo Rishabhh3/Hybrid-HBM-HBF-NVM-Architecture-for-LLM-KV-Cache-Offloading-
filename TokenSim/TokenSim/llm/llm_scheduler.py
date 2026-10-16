@@ -185,6 +185,9 @@ class LLMPagedAttnScheduler(LLMScheduler):
         evict_observer = getattr(self.connector, "hbm_evict_observer", None)
         if evict_observer is not None:
             self.block_manager.kv_cache_manager.set_evict_observer(evict_observer)
+        attach = getattr(self.connector, "attach_kv_cache_manager", None)
+        if attach is not None:
+            attach(self.block_manager.kv_cache_manager)
 
     def schedule(self) -> tuple[list[Request], list[Request]]:
         """The scheduler FSM for dynamic scheduling, basically being ported

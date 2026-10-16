@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from TokenSim.config.config import CacheConfig, KVTransferConfig
+from TokenSim.errors import ConfigurationError
 from TokenSim.llm.llm_request import Request
 from TokenSim.mooncake import (
     PoolKey,
@@ -42,6 +44,7 @@ class MooncakeStoreConnector(BaseKVConnector):
             self.model_name = cache_config.model
             self.rank_info = getattr(cache_config, "rank_info", None)
         self.service = get_mooncake_service(config, block_bytes=self.block_bytes)
+        self._check_partition_ranks(cache_config)
         self.mooncake_stats = self.service.store.stats
         # "mooncake" mirrors the reference vLLM MooncakeStoreConnector
         # (ref/vllm .../kv_connector/v1/mooncake/store/); "every_step" keeps
@@ -63,6 +66,13 @@ class MooncakeStoreConnector(BaseKVConnector):
         self._pending_evict_latency = 0.0
         if self._hbm_evict_policy != "prefill":
             self.mooncake_stats.hbm_evict_reporting = 1
+        self._kv_cache_manager = None
+        self._hbm_first_registered: dict[Any, float] = {}
+        self._hbm_spilled: set[Any] = set()
+        self._run_stats_finalized = False
+        self._count_save_skips = bool(self.service.config.count_aligned_save_skips)
+        if self._count_save_skips:
+            self.mooncake_stats.save_skip_reporting = 1
 
     def get_num_new_matched_tokens(
         self,
@@ -76,31 +86,114 @@ class MooncakeStoreConnector(BaseKVConnector):
         local_gpu_tokens = max(0, int(num_computed_tokens))
         if local_gpu_tokens:
             self.mooncake_stats.local_gpu_hit_tokens += local_gpu_tokens
-        hit = self.service.store.lookup(keys, now=self.simulation_time)
-        if hit.hit_blocks <= 0:
-            return 0
-        hit_keys = list(hit.keys)
-        hit_tokens = hit.hit_blocks * self.block_size
-        if self._aligned and hit_tokens >= req.prefill_len:
-            # Reference behavior: on a full-prompt hit, leave the trailing
-            # block uncomputed-from-cache so prefill still computes tokens.
-            capped_blocks = max(0, (req.prefill_len - 1) // self.block_size)
-            hit_keys = hit_keys[:capped_blocks]
-            hit_tokens = capped_blocks * self.block_size
-        external_tokens = max(0, hit_tokens - local_gpu_tokens)
+        if self.service.config.store_lookup_start == "after_hbm":
+            looked_up = self._lookup_after_hbm(req, keys, local_gpu_tokens)
+            if looked_up is None:
+                return 0
+            hit, hit_keys, external_tokens = looked_up
+            span_start = 0  # hit_keys already begins at the first missing block
+        else:
+            hit = self.service.store.lookup(keys, now=self.simulation_time)
+            if hit.hit_blocks <= 0:
+                return 0
+            hit_keys = list(hit.keys)
+            hit_tokens = hit.hit_blocks * self.block_size
+            if self._aligned and hit_tokens >= req.prefill_len:
+                # Reference behavior: on a full-prompt hit, leave the trailing
+                # block uncomputed-from-cache so prefill still computes tokens.
+                capped_blocks = max(0, (req.prefill_len - 1) // self.block_size)
+                hit_keys = hit_keys[:capped_blocks]
+                hit_tokens = capped_blocks * self.block_size
+            external_tokens = max(0, hit_tokens - local_gpu_tokens)
+            span_start = local_gpu_tokens // self.block_size
         if external_tokens <= 0:
             return 0
-        if hit.tier == "ssd":
+        tier = hit.tier
+        if self.service.config.load_span == "missing":
+            # Attribute the load to the slowest tier of the span actually loaded.
+            tier = self._span_tier(
+                hit_keys[span_start : span_start + external_tokens // self.block_size]
+            )
+        if tier == "ssd":
             self.mooncake_stats.mooncake_disk_hit_tokens += external_tokens
         else:
             self.mooncake_stats.mooncake_memory_hit_tokens += external_tokens
         self._pending_loads[req.id] = {
             "keys": hit_keys,
-            "tier": hit.tier,
+            "tier": tier,
             "tokens": external_tokens,
             "blocks": external_tokens // self.block_size,
+            "span_start": span_start,
         }
         return external_tokens
+
+    def _span_tier(self, keys: list[PoolKey]) -> str | None:
+        tier = None
+        for key in keys:
+            obj = self.service.store.objects.get(key.to_string())
+            if obj is None:
+                continue
+            if obj.tier == "ssd":
+                return "ssd"
+            tier = "memory"
+        return tier
+
+    def _lookup_after_hbm(self, req: Request, keys: list[PoolKey], local_gpu_tokens: int):
+        """store_lookup_start = "after_hbm": look up only beyond the HBM hit.
+
+        Starts at the first block not already hit in HBM, with that block's key,
+        and stops at the first store miss after it. Returns (hit, keys to load,
+        external tokens), or None when nothing beyond the HBM hit is stored. No
+        lookup -- and no hit/miss count -- when the HBM hit already covers every
+        full prompt block.
+        """
+        start = local_gpu_tokens // self.block_size
+        tail = keys[start:]
+        if not tail:
+            return None
+        hit = self.service.store.lookup(tail, now=self.simulation_time)
+        if hit.hit_blocks <= 0:
+            return None
+        hit_keys = list(hit.keys)
+        if self._aligned and (start + len(hit_keys)) * self.block_size >= req.prefill_len:
+            # Same reference cap as the "zero" path, on the absolute span.
+            capped_blocks = max(0, (req.prefill_len - 1) // self.block_size)
+            hit_keys = hit_keys[: max(0, capped_blocks - start)]
+        return hit, hit_keys, len(hit_keys) * self.block_size
+
+    def attach_kv_cache_manager(self, manager) -> None:
+        """Called by the scheduler with its GPU prefix cache.
+
+        Kept only when the HBM-eviction instrumentation is on; under the stock
+        policy nothing is stored and no hook is installed.
+        """
+        if self._hbm_evict_policy == "prefill":
+            return
+        self._kv_cache_manager = manager
+        manager.set_register_observer(self._on_hbm_register)
+
+    def _on_hbm_register(self, block: Any, key: Any) -> None:
+        self._hbm_first_registered.setdefault(key, self.simulation_time)
+
+    def finalize_run_stats(self) -> None:
+        """End-of-run counters; called once per connector before export."""
+        if self._run_stats_finalized or self._kv_cache_manager is None:
+            return
+        self._run_stats_finalized = True
+        stats = self.mooncake_stats
+        keys = self._kv_cache_manager.cached_keys()
+        stats.hbm_evict_residue_blocks += len(keys)
+        if keys:
+            metadata = self._hbm_evict_key_metadata()
+            pool_keys = [PoolKey(metadata, prefix_key_digest(key)) for key in keys]
+            stats.hbm_evict_residue_absent_blocks += len(
+                self.service.store.missing_indices(pool_keys)
+            )
+        delays = sorted(self.service.hbm_first_spill_delays)
+        stats.hbm_evict_first_spill_count = len(delays)
+        if delays:
+            stats.hbm_evict_first_spill_p50_s = _percentile(delays, 0.5)
+            stats.hbm_evict_first_spill_p90_s = _percentile(delays, 0.9)
 
     def set_block_releaser(self, releaser) -> None:
         self._block_releaser = releaser
@@ -153,7 +246,12 @@ class MooncakeStoreConnector(BaseKVConnector):
         else:
             stats.hbm_evict_absent_blocks += 1
 
-        if self._hbm_evict_policy != "on_evict":
+        if prefix_key not in self._hbm_spilled and prefix_key in self._hbm_first_registered:
+            self._hbm_spilled.add(prefix_key)
+            self.service.hbm_first_spill_delays.append(
+                self.simulation_time - self._hbm_first_registered[prefix_key]
+            )
+        if self._hbm_evict_policy not in ("on_evict", "spill_only"):
             return
         # Bytes are read off the store's own counters rather than assumed, so
         # the figure includes any cascade eviction this put forced.
@@ -184,6 +282,41 @@ class MooncakeStoreConnector(BaseKVConnector):
                 dcp_rank=int(self.service.config.dcp_rank),
             )
         return self._hbm_evict_metadata
+
+    def _check_partition_ranks(self, cache_config: CacheConfig | None) -> None:
+        """per_rank partitions must match the number of ranks that write.
+
+        Only TP-rank-0 / PP-rank-0 workers are scheduled when world_size > 1
+        (LLMEngine._is_schedulable_worker), so the store is written by one rank
+        per data-parallel group: data_parallel_size writers, not world_size.
+        """
+        mooncake_config = self.service.config
+        if mooncake_config.store_partition != "per_rank":
+            return
+        parallel_config = getattr(cache_config, "parallel_config", None)
+        if parallel_config is None:
+            return
+        world_size = getattr(parallel_config, "world_size", 1)
+        writers = 1 if world_size == 1 else getattr(parallel_config, "data_parallel_size", None)
+        if writers is not None and writers != mooncake_config.store_partition_ranks:
+            raise ConfigurationError(
+                "store_partition_ranks="
+                + f"{mooncake_config.store_partition_ranks} does not match the "
+                + f"{writers} store-writing ranks (one TP-0/PP-0 worker per "
+                + "data-parallel group)"
+            )
+
+    def _count_save_skip(self, req: Request) -> None:
+        """Record one save skipped because this step loaded from the store.
+
+        missing_indices touches no hit/miss statistics and no LRU heat, so
+        counting does not perturb the run.
+        """
+        keys = self._keys_for_request(req)
+        full_blocks = min(len(keys), req.prefill_len // self.block_size)
+        missing = self.service.store.missing_indices(keys[:full_blocks])
+        self.mooncake_stats.save_skip_requests += 1
+        self.mooncake_stats.save_skip_missing_blocks += len(missing)
 
     def _drain_evict_latency(self) -> float:
         """Media time owed for this step's eviction saves.
@@ -239,6 +372,10 @@ class MooncakeStoreConnector(BaseKVConnector):
                 loads.append(self._build_load_plan(req, load_info))
             if not can_save:
                 continue
+            if self._hbm_evict_policy == "spill_only":
+                # No prefill/admission save: blocks reach the store only
+                # through the HBM-eviction hook (_on_hbm_evict).
+                continue
             if self._aligned:
                 # Reference semantics: saves happen only within the prefill
                 # range (decode steps never save), each request saves at most
@@ -247,6 +384,8 @@ class MooncakeStoreConnector(BaseKVConnector):
                     continue
                 self._saved_request_ids.add(req.id)
                 if load_info is not None:
+                    if self._count_save_skips:
+                        self._count_save_skip(req)
                     continue
             save_keys = self._keys_for_request(req)
             if not save_keys:
@@ -421,9 +560,16 @@ class MooncakeStoreConnector(BaseKVConnector):
             kind="store",
             topology="cross_node",
         )
-        pool_keys = list(load_info["keys"][:blocks])
-        self._request_keys[req.id] = pool_keys
-        keys = self._key_strings_for_request(req)[: len(pool_keys)]
+        if self.service.config.load_span == "missing":
+            # Only the span not already hit in HBM.
+            start = int(load_info.get("span_start", 0))
+            pool_keys = list(load_info["keys"][start : start + blocks])
+            self._request_keys[req.id] = pool_keys
+            keys = [key.to_string() for key in pool_keys]
+        else:
+            pool_keys = list(load_info["keys"][:blocks])
+            self._request_keys[req.id] = pool_keys
+            keys = self._key_strings_for_request(req)[: len(pool_keys)]
         return ConnectorTransferPlan(
             request_ids=[req.id],
             request_block_counts={req.id: blocks},
@@ -533,3 +679,9 @@ class MooncakeStoreConnector(BaseKVConnector):
             if plan.extra.get("connector") == self.name
             or plan.tier in {"memory", "ssd"}
         ]
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    """Nearest-rank percentile of an already sorted, non-empty list."""
+    index = max(0, min(len(sorted_values) - 1, math.ceil(q * len(sorted_values)) - 1))
+    return float(sorted_values[index])

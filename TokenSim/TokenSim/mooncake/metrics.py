@@ -119,6 +119,70 @@ class MooncakeStats:
     hbm_evict_puts_wrote_bytes: int = 0
     hbm_evict_write_bytes: int = 0
     hbm_evict_save_latency: float = 0.0
+    # End of run (hbm_evict_save_policy != "prefill"): keyed blocks still in
+    # the GPU prefix cache of the writing workers, and of those the ones whose
+    # key the store does not hold -- under "spill_only" exactly the blocks the
+    # stock prefill save would have written but no spill ever did.
+    hbm_evict_residue_blocks: int = 0
+    hbm_evict_residue_absent_blocks: int = 0
+    # Time from a key's first registration in the GPU prefix cache (its
+    # admission to HBM) to its first capacity eviction, over every key that
+    # was evicted at least once.
+    hbm_evict_first_spill_count: int = 0
+    hbm_evict_first_spill_p50_s: float = 0.0
+    hbm_evict_first_spill_p90_s: float = 0.0
+    # Prefill saves skipped by the aligned ("mooncake" save_policy) rule that a
+    # step which loads from the store does not save (count_aligned_save_skips).
+    # Omitted from as_dict() unless enabled, like the hbm_evict_* block.
+    # save_skip_missing_blocks counts that request's full prompt blocks the
+    # store did not hold when its save was skipped, i.e. the blocks the skipped
+    # save would have written.
+    save_skip_reporting: int = 0
+    save_skip_requests: int = 0
+    save_skip_missing_blocks: int = 0
+    # store_partition != "global". Memory-tier evictions split by whether the
+    # victim belongs to the same rank as the admission that forced the
+    # eviction; per-rank peak memory-tier occupancy in blocks (the list is in
+    # first-seen rank order) and its min/max; and, under "per_rank", the
+    # per-rank capacity each tier was given. Omitted from as_dict() otherwise.
+    # count_hbf_readback. One "written block" per successful offload write
+    # (a re-write of the same key starts a new instance); "read" counts the
+    # instances read from the offload tier at least once before the next write
+    # of that key or the end of the run. Omitted from as_dict() unless enabled.
+    # count_if_read_gate: if_read demotions, and how many of them had at least
+    # one read actually served from the memory (PCM) tier.
+    if_read_gate_reporting: int = 0
+    if_read_gate_passes: int = 0
+    if_read_gate_passes_pcm_served: int = 0
+    hbf_readback_reporting: int = 0
+    hbf_readback_written_blocks: int = 0
+    hbf_readback_read_blocks: int = 0
+    # count_pcm_admit_source: memory-tier (PCM) admissions by why the key was
+    # absent from the store -- never stored before ("first"), dropped by
+    # demote_policy = if_read, dropped when the offload tier evicted its only
+    # copy, or any other departure (expected 0 with an offload tier). The four
+    # sum to mooncake_memory_write_blocks. Omitted from as_dict() unless enabled.
+    pcm_admit_reporting: int = 0
+    pcm_admit_first_blocks: int = 0
+    pcm_admit_after_if_read_drop_blocks: int = 0
+    pcm_admit_after_hbf_evict_blocks: int = 0
+    pcm_admit_after_other_blocks: int = 0
+    # hbf_capacity_mode = "unlimited" only: the configured offload pool, the
+    # peak number of blocks the tier actually held (the pool total), and the
+    # largest per-partition peak (equal to the pool peak when unpartitioned).
+    hbf_capacity_reporting: int = 0
+    hbf_capacity_configured_blocks: int = 0
+    hbf_capacity_peak_used_blocks: int = 0
+    hbf_capacity_rank_peak_used_blocks_max: int = 0
+    partition_reporting: int = 0
+    partition_ranks_seen: int = 0
+    partition_evictions_cross_rank: int = 0
+    partition_evictions_same_rank: int = 0
+    partition_rank_peak_blocks_min: int = 0
+    partition_rank_peak_blocks_max: int = 0
+    partition_rank_memory_capacity_blocks: int = 0
+    partition_rank_ssd_capacity_blocks: int = 0
+    partition_rank_peak_blocks: list[int] = field(default_factory=list)
     pool_keys: list[str] = field(default_factory=list)
     offload_tiers: list[str] = field(default_factory=list)
     offload_profiles: list[dict[str, Any]] = field(default_factory=list)
@@ -229,6 +293,50 @@ class MooncakeStats:
         "hbm_evict_puts_wrote_bytes",
         "hbm_evict_write_bytes",
         "hbm_evict_save_latency",
+        "hbm_evict_residue_blocks",
+        "hbm_evict_residue_absent_blocks",
+        "hbm_evict_first_spill_count",
+        "hbm_evict_first_spill_p50_s",
+        "hbm_evict_first_spill_p90_s",
+    )
+
+    PARTITION_FIELDS = (
+        "partition_ranks_seen",
+        "partition_evictions_cross_rank",
+        "partition_evictions_same_rank",
+        "partition_rank_peak_blocks_min",
+        "partition_rank_peak_blocks_max",
+        "partition_rank_memory_capacity_blocks",
+        "partition_rank_ssd_capacity_blocks",
+        "partition_rank_peak_blocks",
+    )
+
+    IF_READ_GATE_FIELDS = (
+        "if_read_gate_passes",
+        "if_read_gate_passes_pcm_served",
+    )
+
+    HBF_READBACK_FIELDS = (
+        "hbf_readback_written_blocks",
+        "hbf_readback_read_blocks",
+    )
+
+    PCM_ADMIT_FIELDS = (
+        "pcm_admit_first_blocks",
+        "pcm_admit_after_if_read_drop_blocks",
+        "pcm_admit_after_hbf_evict_blocks",
+        "pcm_admit_after_other_blocks",
+    )
+
+    HBF_CAPACITY_FIELDS = (
+        "hbf_capacity_configured_blocks",
+        "hbf_capacity_peak_used_blocks",
+        "hbf_capacity_rank_peak_used_blocks_max",
+    )
+
+    SAVE_SKIP_FIELDS = (
+        "save_skip_requests",
+        "save_skip_missing_blocks",
     )
 
     def as_dict(self) -> dict[str, Any]:
@@ -249,8 +357,44 @@ class MooncakeStats:
             if self.hbm_evict_reporting
             else {}
         )
+        save_skip = (
+            {name: getattr(self, name) for name in self.SAVE_SKIP_FIELDS}
+            if self.save_skip_reporting
+            else {}
+        )
+        partition = (
+            {name: getattr(self, name) for name in self.PARTITION_FIELDS}
+            if self.partition_reporting
+            else {}
+        )
+        hbf_readback = (
+            {name: getattr(self, name) for name in self.HBF_READBACK_FIELDS}
+            if self.hbf_readback_reporting
+            else {}
+        )
+        if_read_gate = (
+            {name: getattr(self, name) for name in self.IF_READ_GATE_FIELDS}
+            if self.if_read_gate_reporting
+            else {}
+        )
+        pcm_admit = (
+            {name: getattr(self, name) for name in self.PCM_ADMIT_FIELDS}
+            if self.pcm_admit_reporting
+            else {}
+        )
+        hbf_capacity = (
+            {name: getattr(self, name) for name in self.HBF_CAPACITY_FIELDS}
+            if self.hbf_capacity_reporting
+            else {}
+        )
         return {
             **hbm_evict,
+            **if_read_gate,
+            **hbf_readback,
+            **pcm_admit,
+            **hbf_capacity,
+            **save_skip,
+            **partition,
             "mooncake_get_count": self.get_count,
             "mooncake_put_count": self.put_count,
             "mooncake_store_hit_count": self.store_hit_count,

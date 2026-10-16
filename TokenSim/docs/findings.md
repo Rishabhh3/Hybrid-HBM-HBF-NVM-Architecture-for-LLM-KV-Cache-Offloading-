@@ -4943,3 +4943,3283 @@ is where most of that damage comes from.
 | new scripts | `generated_share.py`, `tail_divergence.py`, `build_trace.py --share_partial_tail` |
 | tests | **190** (177 + 13) |
 | simulator change | **none** — no TokenSim source file was modified in PHASE 13 |
+
+---
+
+# PHASE 14 — Fixes for known simulation problems
+
+Append-only. Nothing above is edited; corrections to older entries appear below
+as new notes that point back to them. **PHASE 9 STEP 3 (cap 48) remains the
+headline.** Every behaviour change this phase adds sits behind a config flag
+whose default is stock.
+
+Branch **`phase14-fixes`**, cut from `main` at **`ced3806`**.
+
+## Provenance
+
+| file | md5 | matches PHASE 12 |
+|---|---|---|
+| `conversation_trace.jsonl` (raw) | `bc2f368504912f72f59caee90b5f2e46` | ✓ |
+| `toolagent_trace.jsonl` (raw) | `53cf2bc5eff72e9953348bda80028c93` | ✓ |
+| `conv_5000.jsonl` (built) | `5a19d814562e650fe6e44e4234a4793c` | ✓ |
+| `toolagent_5000.jsonl` (built) | `c6cd3b0c8022eebb88358719a2596f1c` | ✓ |
+| `data/hardware/hardware_models_h3b200.json` | `9b4cba823dd4158d9bd3efe16bf74491` | ✓ |
+
+The trace files were present in `tmp/phase12/` and did not need rebuilding.
+PHASE 14 runs live in `tmp/phase14/runs/` (gitignored); the trace files there
+are symlinks to `tmp/phase12/`.
+
+## STEP 0 — Reproduction gate (no code change)
+
+Configs (b) and (d), cap 48, 30 QPS, W = 5,000, both traces, on `ced3806` with
+`scripts/phase12/run_one.py` unchanged. Model and platform as PHASE 12 Settings:
+`LLaMa2-70B-GQA` (Nhead 64, KV heads 8, Nlayer 80, Dmodel 8192), **FP16**,
+163,840 B/token at TP2, block **2,621,440 B**, TP2/PP1/DP4, `H3-B200-KVONLY`,
+PCM pool 142,213 blk, HBF pool 10,066,329 blk, seed 0. Workload: Mooncake
+FAST'25 traces, **a stand-in for CAG**.
+
+| run | HBF write bytes | HBF blocks | hit rate | reuse hit blk | batch/sched |
+|---|---|---|---|---|---|
+| (b) Conversation | 16,853,376,696,320 ✓ | 6,429,053 ✓ | 0.1643 ✓ | 670,585 ✓ | 23.167889 ✓ |
+| (d) Conversation | 209,508,106,240 ✓ | 79,921 ✓ | 0.0974 ✓ | 397,596 ✓ | 22.378200 ✓ |
+| (b) Tool&Agent | 8,483,936,665,600 ✓ | 3,236,365 ✓ | 0.4037 ✓ | 1,174,042 ✓ | 22.885048 ✓ |
+| (d) Tool&Agent | 85,844,295,680 ✓ | 32,747 ✓ | 0.3650 ✓ | 1,061,727 ✓ | 22.429517 ✓ |
+
+**All 20 values match the report.md "Matched batch (cap 48)" table to the last
+digit.** Beyond the gate, each of the four result files is identical — after
+dropping `simulator_wall_time` and `mooncake_pool_keys` — to its PHASE 13
+counterpart (`tmp/phase12/runs/p13_{b,d}_{conv,ta}_or`). Tests: 190 pass.
+
+## STEP 1a — LIMITATION: rank-scoped keys in one shared, rank-blind pool
+
+Re-verified in source at `ced3806`. Two facts, which pull in opposite
+directions.
+
+**1. Every pool key carries the writer's tp/pp/dp rank.**
+
+| step | file:line |
+|---|---|
+| each worker gets a rank from its global index | `TokenSim/config/cluster_config.py:83` → `ParallelRankInfo.from_global_rank` (`TokenSim/config/parallel_config.py:139-164`) |
+| the engine hands it to its cache config | `TokenSim/llm/llm_engine.py:176`, `:192` |
+| the connector reads it | `TokenSim/kv_transfer/connectors/mooncake_store.py:43` |
+| and builds every request's keys with it | `mooncake_store.py:496-511` → `pool_keys_for_request` (`TokenSim/mooncake/pool_key.py:76-106`) |
+| the key string embeds `tp_rank`, `pp_rank`, `dp_rank` | `pool_key.py:13-23` (`KeyMetadata`), `:31-44` (`to_string`), `:47-73` (`build_key_metadata`) |
+
+Consequence: a prefix saved by one DP group can never be hit by a request routed
+to another DP group, even when the token content is identical. (Within a DP
+group the two TP ranks each key their own head shard — that part is physically
+right, since block bytes are per-rank shards.) In `s0_b_conv`, DP placement is
+1,250 / 1,250 / 1,250 / 1,250 requests.
+
+**2. But there is only one LRU and one capacity counter for all eight workers.**
+
+| step | file:line |
+|---|---|
+| every worker's connector shares one `engine_id` | `TokenSim/config/kv_transfer_config.py:26-27` (one uuid per run), `:61` (`with_worker_defaults` copies it), called at `llm_engine.py:235-242` |
+| so all eight resolve to the same service | `TokenSim/mooncake/service.py:33-39` (singleton keyed on `engine_id` + config fingerprint) |
+| which owns one store with one `memory_capacity_bytes`, one `memory_used_bytes`, one `objects` map and one `memory_lru` | `TokenSim/mooncake/store.py:58-67` |
+| admission frees room against that one counter | `_ensure_memory_capacity`, `store.py:262-281` (loop at `:277`) |
+| by popping the global LRU head, whoever owns it | `_evict_memory_lru`, `store.py:283-284` (`popitem(last=False)`) |
+| the offload tier has the same shape: one `capacity_blocks`, one `_lru` | `TokenSim/mooncake/ssd.py:36-40` |
+
+Consequence: a block admitted by rank *i* can evict a block that only rank *j*
+can ever read, and one rank's burst can occupy capacity the others' working sets
+need. A real deployment of 8 GPUs with a PCM stack each would have per-stack
+capacity — the per-GPU design values in `CLAUDE.md` are exactly that — not one
+pooled LRU.
+
+**Status: unquantified.** Neither effect has been measured. Fact 1 lowers hit
+rates relative to a content-addressed cluster-wide cache (another reason, beside
+PHASE 13 STEP 2, that every hit rate here is a floor). Fact 2 lets capacity
+migrate between ranks, which a per-stack design would not allow; its sign on
+write volume is not known. Both apply equally to every config, so between-config
+comparisons at fixed workload are affected only through second-order
+interactions with policy. STEP 3 of this phase measures fact 2.
+
+## STEP 1b — NOTE: "~10^8 endurance" is unsourced
+
+**Points back to** `findings.md` ENDURANCE/POWER RESCOPE, "Go/no-go for NVSim"
+(~line 1431: *"which PCM's ~10^8 endurance absorbs"*), and the PHASE 4/5
+"Go/no-go for NVSim" (~line 1892: *"PCM's ~10⁸ endurance should absorb it"*).
+
+**Both phrases are unsourced. ~10^8 is not a value.** No document in this tree
+gives a PCM endurance figure, and none was used in any computation — no number
+in this file depends on it. Per `CLAUDE.md`, **PCM endurance stays OPEN.** Read
+both sentences as "PCM's endurance is assumed high" and nothing more.
+
+The LaTeX draft carries the same unsourced claim in prose (see report.md,
+Pending LaTeX sync).
+
+## STEP 1c — NOTE: which timing values are assumed
+
+**PCM media timing is assumed, not sourced.** Config (c)/(d) set
+`memory_media = pcm` and do not override the timing, so every PCM run in this
+file uses the dataclass defaults at `TokenSim/mooncake/config.py:81-84`:
+
+| knob | default | status |
+|---|---|---|
+| `pcm_read_latency_us` | 0.1 | **assumed** |
+| `pcm_write_latency_us` | 1.0 | **assumed** |
+| `pcm_read_bw_gbps` | 100.0 (GiB/s, `store.py` divides by 2^30) | **assumed** |
+| `pcm_write_bw_gbps` | 20.0 (GiB/s) | **assumed** |
+
+The 5× write/read asymmetry was already flagged as assumed at ~line 1434 and
+~line 1883. This note extends that to all four values. Git history in this tree
+starts at `4e9b9fe` (the submodule conversion), so where the defaults came from
+cannot be traced.
+
+**HBF write timing is TokenSim's stock SSD default, not a sourced HBF figure.**
+`ssd_write_latency_us = 200` and `ssd_write_bw_gbps = 3.0` (GiB/s) are the
+`MooncakeConfig` defaults (`config.py:48`, `:46`). `run_one.py` passes them
+explicitly with the same values. PHASE 8 (~lines 2784-2785) and `CLAUDE.md` call
+them "NAND-realistic". That describes intent; it is not a citation. H3 gives HBF
+read bandwidth (8 TB/s) and the LHB argument, but no HBF write latency or write
+bandwidth. **Both write values are unsourced placeholders.**
+
+(The read side differs: `ssd_read_latency_us = 0.1` and `ssd_read_bw_gbps =
+7451` are documented in PHASE 8 as a modelling assumption derived from the
+paper's 8 TB/s and LHB argument. The stock SSD read defaults are 100 µs and
+7.0 GiB/s, `config.py:47`, `:45`.)
+
+## STEP 1d — report.md
+
+`Documents/Report/report.md` "What is established" now quotes the PHASE 9
+STEP 3 cap-48 batch-matched figures, with bytes/request next to every lifetime
+ratio. The cap-256 table is labelled as saturated, with its batch gaps. Stale
+LaTeX figures are listed under "Pending LaTeX sync" but not fixed. No number in
+this file changed.
+
+## STEP 1 — addenda (appended after review; nothing above is edited)
+
+### 1e — CORRECTION: the LaTeX headline does not match its own table
+
+**Points back to** `Documents/Latex/pcm-kv-micro.tex` (abstract l.59–63,
+`sec:headline` l.379–382, Conclusion l.609–611). Those passages quote
+**×90.3 / ×86.4**. Those are the PHASE 8 multipliers (×90.31 / ×86.39, PHASE 8
+STEP 3, batch-unmatched). But `tab:headline` in the same draft is the PHASE 9
+STEP 3 (revised) **cap-256** table, and its own bytes/request give different
+ratios.
+
+Recomputed from result files. The cap-256 (b) and (d) runs were rerun for this
+check (`tmp/phase14/runs/s1_{b,d}256_{conv,ta}`), because the PHASE 9 files no
+longer exist on this machine. All four reproduce the recorded cap-256 HBF write
+bytes exactly (16,938,274,652,160 / 212,252,753,920 / 8,479,548,375,040 /
+146,022,072,320).
+
+| | (b) HBF B/req | (d) HBF B/req | **b ÷ d** | (d) vs (b) batch |
+|---|---|---|---|---|
+| Conversation, cap 256 | 3,387,654,930 | 42,450,551 | **×79.80** | −4.72% |
+| Tool&Agent, cap 256 | 1,695,909,675 | 29,204,414 | **×58.07** | −7.68% |
+| Conversation, cap 48 | 3,370,675,339 | 41,901,621 | **×80.44** | −3.41% |
+| Tool&Agent, cap 48 | 1,696,787,333 | 17,168,859 | **×98.83** | −1.99% |
+
+**Confirmed:** ×79.8 and ×58.1 at cap 256, not ×90.3 / ×86.4. The draft's prose
+and its table come from different phases. **Canonical figure: PHASE 9 STEP 3
+cap 48, ×80.4 / ×98.8**, always quoted with the bytes/request it is computed
+from. The LaTeX is not edited here; it is listed under Pending LaTeX sync in
+report.md.
+
+### 1f — GAP: "concurrency-invariant" is shown only for (b) and (c)
+
+**Points back to** PHASE 9 STEP 4 (~lines 3636–3700). The sweep ran configs
+**(b) and (c) only**. Its conclusion, "Every lifetime number in Phases 8 and 9 —
+×90.31, ×86.39, ×2.05, ×2.09 — holds unchanged from 25% to 99% HBM occupancy"
+(~line 3700), therefore covers ×2.05 / ×2.09 and **not** the (b ÷ d) figures.
+LaTeX `sec:batch` and the Conclusion inherit the same over-reach.
+
+Measured, config (d), from the result files above:
+
+| | cap 48 HBF B/req (batch) | cap 256 HBF B/req (batch) | change |
+|---|---|---|---|
+| Conversation (d) | 41,901,621 (22.38) | 42,450,551 (41.55) | **+1.31%** |
+| Tool&Agent (d) | 17,168,859 (22.43) | 29,204,414 (44.72) | **+70.10%** |
+| *for reference:* Conversation (b) | 3,370,675,339 (23.17) | 3,387,654,930 (43.61) | +0.50% |
+| *for reference:* Tool&Agent (b) | 1,696,787,333 (22.89) | 1,695,909,675 (48.44) | −0.05% |
+
+**Config (d)'s write volume is not shown to be invariant to concurrency.** On
+Tool&Agent it rises by 70% between two points about 2× apart in achieved batch.
+Two points cannot establish a curve, and this is recorded, not explained. Until
+it is measured, every "concurrency-invariant" statement is supported for (b)
+and (c) only. That includes ~line 3700, LaTeX `sec:batch` and the Conclusion.
+None of that old text is edited.
+
+### 1g — addition to 1a: the shared HBF LRU never evicts
+
+`mooncake_ssd_eviction_count = 0` in every result file on this machine (the 8
+PHASE 13 runs, `s0_*`, `s1_*`), and PHASE 9 STEP 3 and PHASE 12 recorded the
+same in their conservation checks. At 10,066,329 blocks (24 TiB) the offload
+tier's single LRU (`ssd.py:36-40`, `:73`) never reaches capacity on these
+workloads. **So cross-rank eviction (fact 2 of 1a) can only occur in the PCM
+memory tier.** STEP 3 counts it there.
+
+## STEP 2 — Do the endurance numbers depend on timing at all?
+
+**Pre-registered rule, fixed before any run:** if HBF bytes/request and PCM
+(memory-tier) bytes/request change by < 5% (the PHASE 12 threshold) for both
+(b) and (d) across every arm below, timing does not contaminate the
+write-volume results.
+
+**Result: the rule FAILS, and it fails only on (d)'s HBF stream.** The largest
+change is **+57.03%** (T&A (d), `pcm_write_bw_gbps` 0.25×). (b)'s HBF stream
+moves ≤ 0.18% and every memory-tier stream moves ≤ 0.54%. Numbers first; the
+reading follows them.
+
+### The flags
+
+| flag | values | where |
+|---|---|---|
+| **`store_timing_mode`** | **`charged`** (default, stock) \| `free` | `mooncake/config.py:95`, validated `:174-179` |
+| **`count_aligned_save_skips`** | **`false`** (default) \| `true` — instrumentation only | `mooncake/config.py:99` |
+
+`free` returns exactly `0.0` from every store-time source, and only from those:
+
+- offload read and write (`mooncake/ssd.py:110`, `:118`)
+- PCM memory-tier media (`mooncake/store.py:382`)
+- every transfer-engine transfer (`mooncake/transfer_engine.py:31-37`, set at
+  `:88`), which covers save and load interconnect time
+
+These are branches, not scale factors, so the `charged` path computes the same
+floats as before. Byte, block, hit and LRU accounting is untouched. A non-stock
+mode is recorded in `mooncake_offload_profiles` (`store.py:438-439`). The stock
+profile is unchanged.
+
+`count_aligned_save_skips` counts saves skipped by the aligned rule
+(`kv_transfer/connectors/mooncake_store.py:265-266` → `_count_save_skip`,
+`:191-201`). The rule is that a step which loads from the store does not save.
+Two counters result:
+
+- `save_skip_requests`: how many saves were skipped.
+- `save_skip_missing_blocks`: the full prompt blocks the store did not hold at
+  that moment, i.e. what the skipped save would have written. It uses
+  `missing_indices`, which touches no hit/miss statistic and no LRU heat.
+
+Both are merged into `result_dict` after `asdict()` through
+`OPTIONAL_MOONCAKE_KEY_PREFIXES` (`util/results.py:400`), as in PHASE 12.
+
+**Byte identity at default, verified.** All new flags are at default, compared
+against `ced3806` (`s0_*`) with the PHASE 12 strip():
+
+```
+diff <(strip s0_b_conv/result_30.0.json) <(strip s2_id_b_conv/result_30.0.json)   -> no output
+diff <(strip s0_b_ta/result_30.0.json)   <(strip s2_id_b_ta/result_30.0.json)     -> no output
+diff <(strip s0_d_conv/result_30.0.json) <(strip s2_id_d_conv/result_30.0.json)   -> no output
+diff <(strip s0_d_ta/result_30.0.json)   <(strip s2_id_d_ta/result_30.0.json)     -> no output
+```
+
+**The counter is behaviourally stock.** `s2_ref_*` (counter on) against
+`s2_id_*`: the only diff in all four is the two added keys,
+`save_skip_missing_blocks` and `save_skip_requests`.
+
+**Tests: 205 pass.** That is 190 pre-existing and unchanged, plus 15 new in
+`tests/test_store_timing_mode.py`. They cover parse/reject, the zero-time
+property on both tiers and on transfers, byte/block counters equal between the
+two modes, connector load and save time at zero, the profile key appearing only
+off stock, the counter's default-off export, its counts on a constructed
+load-then-skip case, and its non-perturbation of the store.
+
+### Runs
+
+Configs (b) and (d), cap 48, 30 QPS, W = 5,000, both traces. Everything not
+named in an arm is exactly the STEP 0 configuration, so the model, FP16,
+block 2,621,440 B, TP2/DP4, pools 142,213 / 10,066,329 blocks and seed 0 are as
+STEP 0. All arms except `id_*` run with `count_aligned_save_skips = true`. Every
+Δ is against the `ref` row of the same config and trace.
+
+- **HBF read 100 µs / 7.0 GiB/s** is the in-tree **stock SSD default, not HBF**
+  (`config.py:45,47`; used at findings ~line 990).
+- **The PCM write arms are sensitivity around an assumption, not values.** The
+  assumed `pcm_write_latency_us = 1.0` and `pcm_write_bw_gbps = 20.0` were each
+  scaled 0.25× and 4×, **one at a time** (that is how "0.25x and 4x of the
+  current assumed values" was read). Under (b) `memory_media = dram`, so these
+  knobs are inert by construction (`store.py:380-383`). The (b) rows confirm
+  it: identical to `ref`.
+- "mem-tier B/req" is `mooncake_memory_write_bytes / 5000`. Under (d) that is
+  PCM. Under (b) it is the DRAM-media memory tier.
+- `notdone = 0`, `preemption_count = 0` in all 32 runs.
+
+### (b) Conversation
+
+| arm | HBF B/req | Δ | mem-tier B/req | Δ | hit rate | reuse hit blk | batch/sched | Δ batch | saves skipped (req / missing blk) | save_wait s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| charged (reference) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1679 | +0.00% | 451 / 113,297 | 6678.3 |
+| store_timing_mode=free | 3,376,638,591 | +0.18% | 1,725,599,580 | +0.17% | 0.1645 | 671,263 | 22.5048 | -2.86% | 424 / 108,739 | 0.0 |
+| HBF read 100 us / 7.0 GiB/s (stock SSD default, not HBF) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1144 | -0.23% | 451 / 113,297 | 6678.3 |
+| pcm_write_latency_us 0.25 (0.25x, sensitivity) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1679 | +0.00% | 451 / 113,297 | 6678.3 |
+| pcm_write_latency_us 4.0 (4x, sensitivity) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1679 | +0.00% | 451 / 113,297 | 6678.3 |
+| pcm_write_bw_gbps 5.0 (0.25x, sensitivity) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1679 | +0.00% | 451 / 113,297 | 6678.3 |
+| pcm_write_bw_gbps 80.0 (4x, sensitivity) | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | 670,585 | 23.1679 | +0.00% | 451 / 113,297 | 6678.3 |
+
+### (b) Tool&Agent
+
+| arm | HBF B/req | Δ | mem-tier B/req | Δ | hit rate | reuse hit blk | batch/sched | Δ batch | saves skipped (req / missing blk) | save_wait s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| charged (reference) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8850 | +0.00% | 155 / 38,882 | 3363.7 |
+| store_timing_mode=free | 1,695,299,404 | -0.09% | 884,929,987 | -0.08% | 0.4041 | 1,175,233 | 22.3338 | -2.41% | 154 / 40,301 | 0.0 |
+| HBF read 100 us / 7.0 GiB/s (stock SSD default, not HBF) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8756 | -0.04% | 155 / 38,882 | 3363.7 |
+| pcm_write_latency_us 0.25 (0.25x, sensitivity) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8850 | +0.00% | 155 / 38,882 | 3363.7 |
+| pcm_write_latency_us 4.0 (4x, sensitivity) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8850 | +0.00% | 155 / 38,882 | 3363.7 |
+| pcm_write_bw_gbps 5.0 (0.25x, sensitivity) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8850 | +0.00% | 155 / 38,882 | 3363.7 |
+| pcm_write_bw_gbps 80.0 (4x, sensitivity) | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | 1,174,042 | 22.8850 | +0.00% | 155 / 38,882 | 3363.7 |
+
+### (d) Conversation
+
+| arm | HBF B/req | Δ | mem-tier B/req | Δ | hit rate | reuse hit blk | batch/sched | Δ batch | saves skipped (req / missing blk) | save_wait s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| charged (reference) | 41,901,621 | +0.00% | 1,987,125,969 | +0.00% | 0.0974 | 397,596 | 22.3782 | +0.00% | 23 / 4,546 | 732.6 |
+| store_timing_mode=free | 38,407,242 | -8.34% | 1,993,910,256 | +0.34% | 0.0939 | 383,177 | 22.4235 | +0.20% | 21 / 3,291 | 0.0 |
+| HBF read 100 us / 7.0 GiB/s (stock SSD default, not HBF) | 41,465,414 | -1.04% | 1,987,467,805 | +0.02% | 0.0974 | 397,596 | 22.3934 | +0.07% | 23 / 4,546 | 731.9 |
+| pcm_write_latency_us 0.25 (0.25x, sensitivity) | 38,445,515 | -8.25% | 1,993,549,545 | +0.32% | 0.0955 | 389,852 | 22.4416 | +0.28% | 24 / 4,591 | 725.2 |
+| pcm_write_latency_us 4.0 (4x, sensitivity) | 38,440,796 | -8.26% | 1,991,415,169 | +0.22% | 0.0976 | 398,298 | 22.4912 | +0.50% | 22 / 4,890 | 738.7 |
+| pcm_write_bw_gbps 5.0 (0.25x, sensitivity) | 37,316,198 | -10.94% | 1,988,093,805 | +0.05% | 0.0954 | 389,354 | 22.7421 | +1.63% | 28 / 7,072 | 2112.7 |
+| pcm_write_bw_gbps 80.0 (4x, sensitivity) | 40,693,662 | -2.88% | 1,986,114,093 | -0.05% | 0.0982 | 400,828 | 22.6286 | +1.12% | 22 / 4,592 | 383.1 |
+
+### (d) Tool&Agent
+
+| arm | HBF B/req | Δ | mem-tier B/req | Δ | hit rate | reuse hit blk | batch/sched | Δ batch | saves skipped (req / missing blk) | save_wait s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| charged (reference) | 17,168,859 | +0.00% | 1,001,932,194 | +0.00% | 0.3650 | 1,061,727 | 22.4295 | +0.00% | 4 / 2,942 | 361.8 |
+| store_timing_mode=free | 20,088,095 | +17.00% | 1,006,519,714 | +0.46% | 0.3677 | 1,069,407 | 22.1144 | -1.40% | 4 / 319 | 0.0 |
+| HBF read 100 us / 7.0 GiB/s (stock SSD default, not HBF) | 17,907,057 | +4.30% | 1,001,193,996 | -0.07% | 0.3650 | 1,061,727 | 22.4782 | +0.22% | 4 / 2,942 | 363.0 |
+| pcm_write_latency_us 0.25 (0.25x, sensitivity) | 24,299,176 | +41.53% | 997,192,630 | -0.47% | 0.3671 | 1,067,775 | 22.4149 | -0.07% | 5 / 3,008 | 372.6 |
+| pcm_write_latency_us 4.0 (4x, sensitivity) | 23,074,439 | +34.40% | 997,790,319 | -0.41% | 0.3672 | 1,068,063 | 22.5458 | +0.52% | 5 / 3,008 | 377.6 |
+| pcm_write_bw_gbps 5.0 (0.25x, sensitivity) | 26,959,938 | +57.03% | 996,674,109 | -0.52% | 0.3668 | 1,066,719 | 22.4234 | -0.03% | 4 / 319 | 1075.2 |
+| pcm_write_bw_gbps 80.0 (4x, sensitivity) | 23,460,315 | +36.64% | 996,548,805 | -0.54% | 0.3676 | 1,069,151 | 22.3224 | -0.48% | 5 / 952 | 198.2 |
+
+
+`save_wait` is listed only because it is the timing variable each arm changes.
+It is **not** a result.
+
+### (b) → (d) at matched arm
+
+Each arm's (d) is compared with the same arm's (b).
+
+| arm | Conv reduction | Conv b ÷ d | Conv (d) vs (b) batch | T&A reduction | T&A b ÷ d | T&A (d) vs (b) batch |
+|---|---|---|---|---|---|---|
+| charged (reference) | 98.76% | ×80.4 | −3.41% | 98.99% | ×98.8 | −1.99% |
+| free | 98.86% | ×87.9 | −0.36% | 98.82% | ×84.4 | −0.98% |
+| HBF read stock SSD default | 98.77% | ×81.3 | −3.12% | 98.94% | ×94.8 | −1.74% |
+| PCM write lat 0.25× | 98.86% | ×87.7 | −3.14% | 98.57% | ×69.8 | −2.05% |
+| PCM write lat 4× | 98.86% | ×87.7 | −2.92% | 98.64% | ×73.5 | −1.48% |
+| PCM write bw 0.25× | 98.89% | ×90.3 | −1.84% | 98.41% | ×62.9 | −2.02% |
+| PCM write bw 4× | 98.79% | ×82.8 | −2.33% | 98.62% | ×72.3 | −2.46% |
+| **range** | **98.76–98.89%** | **×80.4–×90.3** | | **98.41–98.99%** | **×62.9–×98.8** | |
+
+### Batch mismatch — flagged
+
+- **Against `ref`:** every arm is within 3%. The largest gaps are (b) `free`,
+  **−2.86%** (Conv) and **−2.41%** (T&A), and (d) Conv `pbw025`, +1.63%.
+- **(d) vs (b), same arm:** −0.36% to −3.41% (Conv) and −0.98% to −2.46% (T&A).
+  This is the structural gap PHASE 9 recorded.
+- **(d) HBF shifts vs (d) batch gaps against `ref`:**
+  - **T&A:** batch gaps are at most 1.40% in magnitude, against HBF shifts of
+    +4.30% to +57.03%. The largest shift, `pbw025` at +57.03%, has a batch gap
+    of −0.03%. Batch does not explain these.
+  - **Conversation:** batch gaps run +0.07% to +1.63%, against HBF shifts of
+    −1.04% to −10.94%. In `pbw4` the batch gap (+1.12%) is about a third of the
+    HBF shift (−2.88%), so a batch contribution to that one arm cannot be ruled
+    out. On T&A (d) the arm with the
+  largest HBF shift (`pbw025`, +57.03%) has a batch gap of −0.03%.
+
+### Reading
+
+1. **(b)'s write volume is timing-independent.** HBF B/req moves +0.18% /
+   −0.09% when all store time is removed, and 0.00% in every other arm. The
+   memory-tier stream behaves the same. **Every (b) and (c)-type number — the
+   write-through/`always` stream, and the ~51% write-back halving — is not
+   contaminated by timing.** (c) was not run here. This rests on (b), whose
+   `always` stream has the same structure.
+2. **(d)'s PCM (memory-tier) write volume is timing-independent**: ≤ 0.54% in
+   every arm on both traces.
+3. **(d)'s HBF write volume is NOT timing-independent.** Conversation: −1.04%
+   to −10.94%. Tool&Agent: +4.30% to +57.03%. That stream is the `if_read`
+   demotes: blocks read at least once while resident in PCM. Whether a block is
+   read before it is evicted depends on how requests interleave with evictions,
+   and timing changes that interleaving.
+4. **The response is non-monotone. It looks like sensitivity to any
+   perturbation, not a timing law.** On T&A, PCM write latency at **0.25× and
+   at 4×** both *raise* (d) HBF B/req (+41.53% and +34.40%). On Conversation the
+   same two arms both lower it, by an identical −8.25% / −8.26%. Making PCM
+   faster and making it slower move the number the same way. So no direction can
+   be attributed to "timing" here.
+5. **The PHASE 9 cap-48 reference sits at an edge of the spread on both
+   traces.**
+   - Conversation (d) reference: 41,901,621 B/req, the **highest** of the seven
+     arms.
+   - Tool&Agent (d) reference: 17,168,859 B/req, the **lowest** of the seven.
+   - So the T&A headline ratio ×98.8 is the **maximum** of a ×62.9–×98.8 range.
+     The Conversation ×80.4 is the **minimum** of ×80.4–×90.3.
+   - This fits STEP 1f, where T&A (d) moved +70.1% between cap 48 and cap 256.
+6. **What survives.** The *reduction* (b) → (d) stays within
+   **98.41–98.99%** in every arm. The bytes/request (d) writes to HBF stay
+   between 17.2 M (17,168,859, T&A reference) and 41.9 M (41,901,621, Conv
+   reference), against 1.70–3.38 G under (b). The **ratio** is the fragile figure, as PHASE 13 already
+   said.
+
+**Consequence for quoting.** (d)'s HBF bytes/request, and anything divided by
+it, should be quoted as a **range over perturbations**, not as one run's value:
+
+- Conversation: 37.3–41.9 M B/req (×80.4–×90.3)
+- Tool&Agent: 17.2–27.0 M B/req (×62.9–×98.8)
+
+The single-run figures ×80.4 / ×98.8 are not wrong, but they carry no error bar.
+A seed or arrival-jitter replicate set would separate perturbation sensitivity
+from timing proper. **It is not run here, as it was not asked for.**
+
+### Settings
+
+| | |
+|---|---|
+| code commit | **`9e8b4d1`** (flags, counter, tests, driver) on `phase14-fixes`; STEP 1 docs commit **`1797110`** |
+| driver / table | `scripts/phase14/step2.sh`, `scripts/phase14/step2_table.py` |
+| runs | `tmp/phase14/runs/s2_{id,ref,free,ssd,plat025,plat4,pbw025,pbw4}_{b,d}_{conv,ta}` (32) |
+| traces / hardware | md5s as in Provenance above, unchanged |
+| hardware numbers | **none invented or changed.** The stock SSD read values are in-tree defaults. The PCM arms are multiples of in-tree assumed defaults, labelled as such |
+
+### STEP 2 — verdict, stated plainly (appended after review)
+
+**The pre-registered rule failed.**
+
+| stream | max \|Δ\| vs charged reference, all arms | rule (< 5%) |
+|---|---|---|
+| (b) HBF B/req, both traces | 0.18% | **pass** |
+| (b) memory-tier B/req, both traces | 0.17% | **pass** |
+| (d) PCM B/req, both traces | 0.54% | **pass** |
+| **(d) HBF B/req, Conversation** | **10.94%** | **FAIL** |
+| **(d) HBF B/req, Tool&Agent** | **57.03%** | **FAIL** |
+
+**How much is moving, in absolute terms.** (d)'s HBF stream is small, so a
+large percentage is a small number of blocks:
+
+| | (d) HBF write blocks, min – max over the 7 arms | spread | as % of (b)'s HBF stream (ref) |
+|---|---|---|---|
+| Tool&Agent | 32,747 (ref) – 51,422 (`pbw025`) | **~18,700 blocks** (18,675) | **0.58%** of 3,236,365 |
+| Conversation | 71,175 (`pbw025`) – 79,921 (ref) | **~8,700 blocks** (8,746) | **0.14%** of 6,429,053 |
+
+**What holds and what does not:**
+
+- The (b) → (d) **reduction holds**: **98.41–98.99%** (T&A) and
+  **98.76–98.89%** (Conv), in every arm.
+- The **ratio does not hold**: ×62.9–×98.8 (T&A) and ×80.4–×90.3 (Conv).
+
+**PHASE 9's cap-48 T&A (d) value (32,747 blocks, 17,168,859 B/req) is the
+lowest-write arm measured.** So **×98.8 is the top of its range**, not a central
+value. The cap-48 Conversation (d) value is the highest-write arm, so ×80.4 is
+the bottom of its range.
+
+Whether this is a timing effect or run-to-run sensitivity is STEP 2b.
+
+## STEP 2b — Replicates
+
+### 2b(a) — `--random_seed` is inert on these runs
+
+(d) Tool&Agent, cap 48, seeds 0, 1 and 2 (`scripts/phase14/run_one.py`, which is
+the PHASE 12 command with the seed exposed). The stripped results are
+**byte-identical** across all three, and identical to `s0_d_ta`: md5
+`78ba8472d06c6393192290b386eadf08` for all four.
+
+The seed reaches only three places:
+
+- the synthetic workload generator (`TokenSim/workload/loaders.py:58-65`)
+- MoE expert routing (`TokenSim/latency/roofline.py:51`)
+- the per-worker latency-backend seed (`TokenSim/llm/llm_engine.py:226`)
+
+The qwen_jsonl loader draws no random numbers, and `LLaMa2-70B-GQA` is dense.
+**The seed is inert, so it cannot provide replicates.**
+
+### 2b(b) — `--arrival_jitter_ms` / `--jitter_seed`
+
+| flag | default | where |
+|---|---|---|
+| `--arrival_jitter_ms` | **0.0 (stock)** | `benchmark.py`, applied in `apply_arrival_jitter` (`TokenSim/workload/loaders.py`) |
+| `--jitter_seed` | 0 | same |
+
+How the jitter works:
+
+- Each timestamped arrival is offset by `uniform(-j, +j)` ms.
+- The draw comes from a private `random.Random(jitter_seed)`, never the global
+  generators, one draw per request in file order.
+- It is applied on the **trace clock, before** `--trace_target_qps` scaling. The
+  simulated offset is therefore j × scale: ×0.1046 on Conversation (native
+  3.138 QPS → 30) and ×0.2020 on Tool&Agent (native 6.059 QPS → 30).
+- A result below 0 is clamped to 0.
+- `j = 0` returns the list untouched and draws nothing.
+- These are CLI arguments. The result file records neither, so stock output
+  gains no keys.
+
+**j = 0.5 ms was chosen as half the trace's 1 ms timestamp resolution. This is a
+methodology choice, not a hardware number.** The premise behind it turned out to
+be wrong; see the caveat below.
+
+**Byte identity, verified:** the new code without the flag (`s2b_id_*`) against
+`ced3806` (`s0_*`), for (b) and (d) on both traces → **no diff in all four.**
+**Tests: 213 pass** (205 + 8 new in `tests/test_arrival_jitter.py`).
+
+### 2b(c) — 40 runs
+
+Five replicates (`--jitter_seed 1..5`, j = 0.5 ms) of (b) and (d), both traces,
+caps 48 and 256. Timing is charged, all values stock, and otherwise as STEP 0.
+`notdone = 0` in all 40.
+
+| cap | config | trace | HBF B/req mean [min, max] | spread | PCM B/req mean [min, max] | spread | hit rate mean [min, max] | batch/sched mean [min, max] | notdone |
+|---|---|---|---|---|---|---|---|---|---|
+| 48 | (b) | Conversation | 3,386,787,129 [3,372,843,794, 3,401,276,981] | 0.84% | 1,730,673,849 [1,723,702,182, 1,737,918,775] | 0.82% | 0.1587 [0.1561, 0.1610] | 22.835 [22.359, 23.578] | 0 |
+| 48 | (b) | Tool&Agent | 1,737,374,564 [1,697,780,335, 1,756,610,691] | 3.39% | 905,967,567 [886,170,452, 915,585,630] | 3.25% | 0.3916 [0.3863, 0.4001] | 22.338 [21.926, 22.921] | 0 |
+| 48 | (d) | Conversation | 33,517,942 [29,316,612, 37,516,476] | 24.46% | 1,994,186,451 [1,988,735,009, 2,002,482,889] | 0.69% | 0.0880 [0.0838, 0.0946] | 22.595 [22.256, 23.127] | 0 |
+| 48 | (d) | Tool&Agent | 17,798,948 [13,412,336, 22,079,341] | 48.69% | 1,005,200,291 [1,002,518,348, 1,011,733,234] | 0.92% | 0.3573 [0.3531, 0.3650] | 21.737 [20.997, 22.666] | 0 |
+| 256 | (b) | Conversation | 3,404,593,627 [3,393,219,723, 3,417,887,474] | 0.72% | 1,739,577,098 [1,733,890,146, 1,746,224,022] | 0.71% | 0.1584 [0.1557, 0.1605] | 43.341 [42.649, 44.837] | 0 |
+| 256 | (b) | Tool&Agent | 1,737,201,340 [1,706,404,872, 1,754,431,750] | 2.76% | 905,880,954 [890,482,721, 914,496,160] | 2.65% | 0.3900 [0.3856, 0.3983] | 47.136 [45.413, 48.526] | 0 |
+| 256 | (d) | Conversation | 37,046,085 [25,754,599, 44,074,271] | 49.45% | 1,985,105,258 [1,973,800,141, 2,006,616,900] | 1.65% | 0.0919 [0.0894, 0.0959] | 42.229 [41.539, 43.771] | 0 |
+| 256 | (d) | Tool&Agent | 20,741,253 [17,543,725, 22,895,657] | 25.80% | 1,000,530,667 [995,065,594, 1,005,966,066] | 1.09% | 0.3602 [0.3536, 0.3671] | 43.119 [41.006, 44.593] | 0 |
+
+"spread" is (max − min) ÷ mean over the five replicates.
+
+**Batch mismatch — flagged**
+
+- **(d) vs (b), replicate means:** cap 48 is −1.05% (Conv) and −2.69% (T&A).
+  Cap 256 is −2.57% (Conv) and **−8.52% (T&A)**. The T&A cap-256 gap is the
+  largest in this phase.
+- **Jittered vs unjittered, same config and cap:**
+  - cap 48: (b) −1.44% / −2.39%, (d) +0.97% / −3.09%
+  - cap 256: (b) −0.61% / −2.69%, (d) +1.63% / −3.58%
+
+### CAVEAT, discovered in this step: the jitter is not zero-mean noise
+
+**The "1 ms timestamp resolution" premise is false.** The raw FAST'25
+`timestamp` field is in milliseconds, but its values are whole seconds: every
+value mod 1000 is 0, 999 or 1. They are also clustered about 3 s apart.
+
+| | requests (W = 5,000) | distinct arrival times ("bursts") | mean requests / burst | smallest gap between bursts | continuations in the **same burst** as their predecessor |
+|---|---|---|---|---|---|
+| Conversation | 5,000 | **532** | 9.4 | 2.999 s | **495 / 2,001 = 24.7%** |
+| Tool&Agent | 5,000 | **276** | 18.1 | 2.999 s | **1,137 / 2,012 = 56.5%** |
+
+Every request shares its timestamp with at least one other. So ±0.5 ms never
+moves a request into another burst. **It only randomly permutes the order of
+requests within each burst.** Without jitter, `LLMSource` keeps file order
+within a burst, because it uses a stable sort (`util/request.py:34-39`). A
+continuation that shared a burst with its predecessor therefore always arrived
+after it. Under jitter it arrives first about half the time, and then it cannot
+hit the prefix its predecessor would have saved.
+
+The shift is systematic, not scatter:
+
+| | jittered runs with a **lower** hit rate than the unjittered run | jittered runs with **higher** HBF B/req than the unjittered run |
+|---|---|---|
+| (b), all 4 trace × cap cells | **20 / 20** | **20 / 20** |
+| (d) Conv cap 48 / cap 256 | 5/5 / 4/5 | 0/5 / 1/5 |
+| (d) T&A cap 48 / cap 256 | 5/5 / 5/5 | 2/5 / 0/5 |
+
+**So the jittered replicates are a workload variant, "within-burst arrival
+order randomized", and not replicates of the unjittered workload.** Their
+spread *is* a valid measure of sensitivity to within-burst order. The trace does
+not record that order; the stock run assumes file order. But their *location*
+is shifted relative to every unjittered run, including all STEP 2 arms.
+
+### 2b(d) — the two questions, numbers only
+
+**Q1. Does the replicate spread of (d) HBF B/req cover the STEP 2 spread?**
+
+| trace | STEP 2 arms [min, max] | replicates [min, max] | replicates + unjittered ref [min, max] | replicates + unjittered ref cover STEP 2? |
+|---|---|---|---|---|
+| Conversation | 37,316,198, 41,901,621 | 29,316,612, 37,516,476 | 29,316,612, 41,901,621 | yes |
+| Tool&Agent | 17,168,859, 26,959,938 | 13,412,336, 22,079,341 | 13,412,336, 22,079,341 | no |
+
+
+| | STEP 2 range width | replicate range width | width ratio |
+|---|---|---|---|
+| Conversation | 4,585,423 | 8,199,864 | **1.79×** |
+| Tool&Agent | 9,791,079 | 8,667,005 | **0.89×** |
+
+- **Replicates alone cover the STEP 2 range: no, on both traces.**
+  - Conv: replicate max 37,516,476 < STEP 2 max 41,901,621.
+  - T&A: replicate max 22,079,341 < STEP 2 max 26,959,938.
+- **Widths are comparable.** The replicate spread is 1.79× the STEP 2 spread on
+  Conv and 0.89× on T&A.
+- The non-coverage is a location shift (the caveat above), not a narrower
+  spread.
+
+**Q2. Is the cap-48 vs cap-256 gap in (d) T&A (+70.10%) larger than the
+replicate spread at either cap?**
+
+| trace | single runs (s1 vs s0) | replicate means, cap 256 vs cap 48 | cap-48 replicate range | cap-256 replicate range | ranges overlap? | spread cap 48 / cap 256 |
+|---|---|---|---|---|---|---|
+| Conversation | +1.31% | +10.53% | 29,316,612 – 37,516,476 | 25,754,599 – 44,074,271 | yes | 24.46% / 49.45% |
+| Tool&Agent | +70.10% | +16.53% | 13,412,336 – 22,079,341 | 17,543,725 – 22,895,657 | yes | 48.69% / 25.80% |
+
+| (d) | cap-256 replicate ÷ cap-48 replicate, all 25 pairs: min / max |
+|---|---|
+| Conversation | −31.35% / +50.34% |
+| Tool&Agent | −20.54% / **+70.71%** |
+
+- **T&A replicate spread:** 48.69% of the mean at cap 48, 25.80% at cap 256.
+- **The single-run gap, +70.10%, exceeds both spreads as a percentage of the
+  mean.** But it lies **inside** the range of cap-256 ÷ cap-48 differences
+  between individual replicates (−20.54% to +70.71%).
+- **The gap between replicate means is +16.53%**, smaller than the spread at
+  either cap. The two caps' replicate ranges **overlap**: 13.4–22.1 M against
+  17.5–22.9 M.
+- **Conversation:** single-run +1.31%, replicate means +10.53%. Ranges overlap.
+- **Batch is not shown to drive the cap-48 → cap-256 change in (d).**
+
+### Not concluded here
+
+Whether STEP 2's failure is "run-to-run sensitivity rather than timing" is the
+question the jitter was meant to settle. Because of the caveat it settles it
+only partly:
+
+- **Settled:** (d)'s HBF B/req moves by amounts comparable to the STEP 2 spread
+  under a perturbation that involves **no timing change at all**, only
+  within-burst order.
+- **Not settled:** what the spread around the *unjittered* workload is. A
+  perturbation that preserves within-burst file order is needed for that. One
+  option is jitter applied to burst times only, with the same offset for every
+  request in a burst. Another is jitter with j ≥ 1.5 s, which moves requests
+  between bursts. Neither is chosen or run here.
+
+### Settings
+
+| | |
+|---|---|
+| code | **`5108029`** (jitter flag, tests, harness) on `phase14-fixes` |
+| runs | `tmp/phase14/runs/s2b_seed{0,1,2}_d_ta`, `s2b_id_{b,d}_{conv,ta}`, `s2b_j{1..5}_c{48,256}_{b,d}_{conv,ta}` (47) |
+| table | `scripts/phase14/step2b_table.py tmp/phase14` |
+| hardware numbers | none invented or changed |
+
+## STEP 2b — revised after review: request-mode jitter is a sensitivity result; clean replicates use burst-mode jitter
+
+The decision after review: keep per-request jitter as a named workload variant,
+and add burst-level jitter for replicates. Code commit and settings are at the
+end of this section.
+
+### The flag, now with a mode
+
+| flag | values | clock | what moves |
+|---|---|---|---|
+| `--arrival_jitter_ms` | **0 (default, stock)**, or j > 0 | — | — |
+| `--arrival_jitter_mode` | **`request`** (default when j > 0) | trace clock, before `--trace_target_qps` | each request independently. **A workload variant** |
+| | `burst` | **replay clock, after rescaling** | all requests sharing an arrival time, by one shared offset. **Guarded:** after jittering, arrival order must equal file order exactly, otherwise `WorkloadValidationError` and the run does not start |
+
+`request` is the behaviour of `5108029` under its new name. `s2c_req_d_ta`, with
+`--arrival_jitter_mode request` passed explicitly, reproduces `s2b_j1_c48_d_ta`
+byte for byte. **Byte identity at default, verified again on the new code:**
+`s2c_id_{b,d}_{conv,ta}` against `ced3806` (`s0_*`) → **no diff in all four.**
+**Tests: 221 pass** (213 + 8 new burst-mode tests in
+`tests/test_arrival_jitter.py`). They cover identity at 0, one shared offset
+per burst, bounds, order kept, the guard firing when bursts swap and on a trace
+not in time order, determinism, and replay-clock application.
+
+### LIMITATION — within-second request order is not recorded in the trace
+
+The FAST'25 `timestamp` field has whole-second values, clustered at ~3 s
+(STEP 2b caveat above). The order of requests within one burst is therefore not
+in the data. **TokenSim replays file order within a burst** (stable sort,
+`util/request.py:34-39`). Every result in this file assumes that order. This
+matters because a continuation can only hit its predecessor's prefix if the
+predecessor arrives first, and 24.7% (Conv) / 56.5% (T&A) of continuations
+share a burst with their predecessor.
+
+### Request-mode jitter as an intra-burst-order SENSITIVITY result (the earlier 2b runs)
+
+The 40 `s2b_j*` runs (j = 0.5 ms, request mode, seeds 1–5) are re-labelled here
+as a sensitivity result. **They are not noise.** Each seed permutes requests
+within bursts.
+
+**Continuations that arrive before their predecessor**
+(`scripts/phase14/intraburst_order.py`, PHASE 12 STEP C pair rule, W = 5,000):
+
+| | pairs | same burst | stock (file order) | seed 1 | seed 2 | seed 3 | seed 4 | seed 5 |
+|---|---|---|---|---|---|---|---|---|
+| Conversation | 2,001 | 495 (24.7%) | 0 (0.0%) | 233 (11.6%) | 226 (11.3%) | 260 (13.0%) | 228 (11.4%) | 255 (12.7%) |
+| Tool&Agent | 2,012 | 1,137 (56.5%) | 0 (0.0%) | 551 (27.4%) | 560 (27.8%) | 575 (28.6%) | 550 (27.3%) | 564 (28.0%) |
+
+As expected, about half of the same-burst pairs are reversed.
+
+**Effect against the stock (file-order) run**, five seeds:
+
+| cap | config | trace | stock hit rate | request-mode hit rate, Δ vs stock: mean [min, max] | stock HBF B/req | request-mode HBF B/req, Δ vs stock: mean [min, max] |
+|---|---|---|---|---|---|---|
+| 48 | (b) | Conversation | 0.1643 | -3.42% [-5.00%, -2.00%] | 3,370,675,339 | +0.48% [+0.06%, +0.91%] |
+| 48 | (b) | Tool&Agent | 0.4037 | -2.99% [-4.29%, -0.89%] | 1,696,787,333 | +2.39% [+0.06%, +3.53%] |
+| 48 | (d) | Conversation | 0.0974 | -9.65% [-13.99%, -2.88%] | 41,901,621 | -20.01% [-30.03%, -10.47%] |
+| 48 | (d) | Tool&Agent | 0.3650 | -2.12% [-3.27%, -0.01%] | 17,168,859 | +3.67% [-21.88%, +28.60%] |
+| 256 | (b) | Conversation | 0.1631 | -2.88% [-4.51%, -1.54%] | 3,387,654,930 | +0.50% [+0.16%, +0.89%] |
+| 256 | (b) | Tool&Agent | 0.4014 | -2.84% [-3.93%, -0.75%] | 1,695,909,675 | +2.43% [+0.62%, +3.45%] |
+| 256 | (d) | Conversation | 0.0942 | -2.42% [-5.13%, +1.86%] | 42,450,551 | -12.73% [-39.33%, +3.82%] |
+| 256 | (d) | Tool&Agent | 0.3733 | -3.51% [-5.29%, -1.67%] | 29,204,414 | -28.98% [-39.93%, -21.60%] |
+
+- **On (b):** reordering within a burst lowers the hit rate by 2.8–3.4% on
+  average. HBF B/req rises by +0.5% (Conv) to +2.4% (T&A).
+- **On (d):** HBF B/req moves −29.0% to +3.7% on average. Individual seeds span
+  −39.9% to +28.6%.
+- **Conclusion:** the stock file order is a favourable order for prefix reuse.
+  That is expected: predecessors precede continuations in the file.
+
+### Burst-mode jitter — the clean replicates
+
+**Inter-burst gaps in replay time** (`scripts/phase14/burst_gaps.py`, the
+simulator's own loader, W = 5,000, `--trace_target_qps 30`):
+
+| | bursts | gap min | gap p50 | gap max | **j = 0.45 × min** |
+|---|---|---|---|---|---|
+| Conversation | 532 | 313.706 ms | 313.810 ms | 313.915 ms | **141.168 ms** |
+| Tool&Agent | 276 | 605.737 ms | 605.939 ms | 606.141 ms | **272.582 ms** |
+
+The gaps are almost constant: the trace issues one burst every ~3 s of trace
+time. **j = 0.45 × the minimum gap is a methodology choice, not a hardware
+number.** At 2j < min gap no two bursts can swap. The order guard confirmed this
+in all 40 runs: none failed.
+
+**40 runs:** `--arrival_jitter_mode burst`, `--jitter_seed 1..5`, (b) and (d),
+both traces, caps 48 and 256. Timing is charged, all values stock, and
+otherwise as STEP 0. `notdone = 0` in all 40.
+
+| cap | config | trace | HBF B/req mean [min, max] | spread | PCM B/req mean [min, max] | spread | hit rate mean [min, max] | batch/sched mean [min, max] | notdone |
+|---|---|---|---|---|---|---|---|---|---|
+| 48 | (b) | Conversation | 3,373,740,746 [3,370,120,643, 3,377,824,530] | 0.23% | 1,724,150,658 [1,722,340,606, 1,726,192,550] | 0.22% | 0.1643 [0.1641, 0.1647] | 23.184 [23.167, 23.198] | 0 |
+| 48 | (b) | Tool&Agent | 1,696,381,954 [1,691,782,480, 1,699,508,388] | 0.46% | 885,471,261 [883,171,525, 887,034,479] | 0.44% | 0.4033 [0.4027, 0.4037] | 22.894 [22.807, 22.939] | 0 |
+| 48 | (d) | Conversation | 37,965,477 [32,048,677, 41,914,728] | 25.99% | 1,991,880,003 [1,986,138,210, 2,002,090,721] | 0.80% | 0.0951 [0.0917, 0.0979] | 22.473 [22.370, 22.583] | 0 |
+| 48 | (d) | Tool&Agent | 21,749,039 [19,802,882, 26,329,219] | 30.01% | 1,001,879,555 [997,253,448, 1,004,686,279] | 0.74% | 0.3676 [0.3643, 0.3696] | 22.325 [22.151, 22.402] | 0 |
+| 256 | (b) | Conversation | 3,385,905,696 [3,382,722,429, 3,390,542,709] | 0.23% | 1,730,233,133 [1,728,641,499, 1,732,551,639] | 0.23% | 0.1639 [0.1631, 0.1646] | 43.925 [43.838, 44.012] | 0 |
+| 256 | (b) | Tool&Agent | 1,693,402,740 [1,687,769,580, 1,696,351,126] | 0.51% | 883,981,654 [881,165,074, 885,455,847] | 0.49% | 0.4011 [0.4000, 0.4030] | 48.347 [47.714, 48.704] | 0 |
+| 256 | (d) | Conversation | 41,693,269 [38,663,094, 45,437,420] | 16.25% | 1,984,781,248 [1,982,704,648, 1,988,798,972] | 0.31% | 0.0946 [0.0923, 0.0992] | 41.934 [41.595, 42.114] | 0 |
+| 256 | (d) | Tool&Agent | 25,567,953 [22,920,298, 27,843,887] | 19.26% | 995,091,599 [992,346,112, 1,000,926,609] | 0.86% | 0.3708 [0.3695, 0.3717] | 44.902 [44.687, 45.119] | 0 |
+
+"spread" is (max − min) ÷ mean over the five replicates.
+
+**Burst jitter is neutral on (b).** Against the stock run, the replicate-mean
+hit rate moves −0.08% to +0.52% and HBF B/req −0.15% to +0.09%. The stock (b)
+value lies inside the replicate range in all four cells. Compare request mode:
+−2.8% to −3.4% hit rate in every cell.
+
+**Batch mismatch — flagged.**
+
+| | (d) vs (b), replicate means | burst vs stock, (b) | burst vs stock, (d) |
+|---|---|---|---|
+| cap 48 Conversation | −3.07% | +0.07% | +0.42% |
+| cap 48 Tool&Agent | −2.49% | +0.04% | −0.47% |
+| cap 256 Conversation | −4.53% | +0.72% | +0.92% |
+| cap 256 Tool&Agent | **−7.13%** | −0.19% | +0.40% |
+
+**Where the stock single run sits within the clean replicates**, for (d) HBF
+B/req:
+
+| | stock value | replicates [min, max] | stock position |
+|---|---|---|---|
+| Conv cap 48 | 41,901,621 | 32,048,677 – 41,914,728 | inside, 2nd highest of 6 |
+| **T&A cap 48** | **17,168,859** | 19,802,882 – 26,329,219 | **below all five** |
+| Conv cap 256 | 42,450,551 | 38,663,094 – 45,437,420 | inside, 3rd highest of 6 |
+| **T&A cap 256** | **29,204,414** | 22,920,298 – 27,843,887 | **above all five** |
+
+**(b) → (d) at the same seed, clean replicates:**
+
+| | reduction | b ÷ d |
+|---|---|---|
+| Conv cap 48 | 98.76–99.05% | ×80.5–×105.2 |
+| T&A cap 48 | 98.44–98.83% | ×64.3–×85.7 |
+| Conv cap 256 | 98.66–98.86% | ×74.5–×87.6 |
+| T&A cap 256 | 98.35–98.65% | ×60.6–×73.8 |
+
+The PHASE 9 single-run T&A ratio **×98.8 is above every clean replicate**
+(max ×85.7).
+
+### Q1 and Q2 with the clean replicates — numbers only
+
+**Q1. Does the replicate spread of (d) HBF B/req cover the STEP 2 spread?**
+
+| trace | STEP 2 arms [min, max] | replicates [min, max] | replicates + unjittered ref [min, max] | replicates + unjittered ref cover STEP 2? |
+|---|---|---|---|---|
+| Conversation | 37,316,198, 41,901,621 | 32,048,677, 41,914,728 | 32,048,677, 41,914,728 | yes |
+| Tool&Agent | 17,168,859, 26,959,938 | 19,802,882, 26,329,219 | 17,168,859, 26,329,219 | no |
+
+
+| | STEP 2 width | replicate width | ratio | STEP 2 non-reference arms inside replicate range |
+|---|---|---|---|---|
+| Conversation | 4,585,423 | 9,866,051 | **2.15×** | 6 / 6 |
+| Tool&Agent | 9,791,079 | 6,526,337 | **0.67×** | 4 / 6 (`ssd` 17,907,057 below, `pbw025` 26,959,938 above) |
+
+- **Conversation: yes.** Replicates alone, 32.0–41.9 M, contain the whole STEP 2
+  range, 37.3–41.9 M.
+- **Tool&Agent: no.** The STEP 2 range runs 17.2–27.0 M. Its low end is the
+  stock run itself, below every replicate. Its high end, `pbw025`, is 2.4% above
+  the replicate max. Four of the six timing arms fall inside the replicate range.
+
+**Q2. Is the cap-48 vs cap-256 gap in (d) T&A (+70.10%) larger than the
+replicate spread at either cap?**
+
+| trace | single runs (s1 vs s0) | replicate means, cap 256 vs cap 48 | cap-48 replicate range | cap-256 replicate range | ranges overlap? | spread cap 48 / cap 256 |
+|---|---|---|---|---|---|---|
+| Conversation | +1.31% | +9.82% | 32,048,677 – 41,914,728 | 38,663,094 – 45,437,420 | yes | 25.99% / 16.25% |
+| Tool&Agent | +70.10% | +17.56% | 19,802,882 – 26,329,219 | 22,920,298 – 27,843,887 | yes | 30.01% / 19.26% |
+
+| (d) | cap-256 ÷ cap-48, all 25 replicate pairs: min / max |
+|---|---|
+| Conversation | −7.76% / +41.78% |
+| Tool&Agent | −12.95% / +40.61% |
+
+- **The single-run +70.10% is larger than the spread at either cap** (30.01% at
+  cap 48, 19.26% at cap 256). It is also larger than every replicate pair
+  (max +40.61%).
+- **The replicates do not reproduce it.**
+  - The replicate-mean gap is **+17.56%**, smaller than the spread at either
+    cap, and the two ranges overlap.
+  - The stock cap-48 run is below all five cap-48 replicates. The stock cap-256
+    run is above all five cap-256 replicates.
+- **Conversation:** single-run +1.31%, replicate means +9.82%. Ranges overlap.
+- Per the decision rule: **batch is not shown to drive the cap-48 → cap-256
+  change in (d).**
+
+### Rule for STEP 3
+
+The clean replicate spread of (d) HBF B/req is **25.99% / 30.01% at cap 48** and
+**16.25% / 19.26% at cap 256**. That is above 5% of the mean at both caps, on
+both traces. **So STEP 3 runs 3 burst-jitter replicates per sweep point and
+reports ranges.**
+
+### Settings
+
+| | |
+|---|---|
+| code | **`20695c3`** on `phase14-fixes` |
+| scripts | `scripts/phase14/{step2c.sh,burst_gaps.py,intraburst_order.py,step2b_table.py}`. Table: `step2b_table.py tmp/phase14 s2c` |
+| runs | `tmp/phase14/runs/s2c_id_*` (4), `s2c_req_d_ta` (1), `s2c_j{1..5}_c{48,256}_{b,d}_{conv,ta}` (40) |
+| traces / hardware | md5s as in Provenance, unchanged. No hardware number invented or changed |
+
+## STEP 3 prelude — jitter size, (c) replicates, and a note on the request-mode table
+
+Driver: `scripts/phase14/prelude3.sh`. Runs: `tmp/phase14/runs/p3_*` (20). The
+configuration is otherwise as STEP 0: cap 48, 30 QPS, W = 5,000, charged timing,
+stock values. `notdone = 0` in all 20.
+
+### Prelude (a) — does (d)'s replicate spread depend on the jitter size?
+
+(d), cap 48, burst mode, seeds 1–5, at **j = 0.05 × the minimum inter-burst
+gap**: Conversation 0.05 × 313.706 ms = **15.685 ms**, Tool&Agent
+0.05 × 605.737 ms = **30.287 ms** (`burst_gaps.py ... 0.05`). This is a
+methodology choice, not a hardware number. It is compared with the j = 0.45
+replicates (`s2c_j*_c48_d_*`).
+
+| (d) HBF B/req, cap 48 | j | mean [min, max] | **spread** | stock run (j = 0) |
+|---|---|---|---|---|
+| Conversation | 0.05 × gap (15.685 ms) | 40,021,629 [38,428,738, 41,851,290] | **8.55%** | 41,901,621 (0.12% above the max) |
+| Conversation | 0.45 × gap (141.168 ms) | 37,965,477 [32,048,677, 41,914,728] | **25.99%** | inside |
+| Tool&Agent | 0.05 × gap (30.287 ms) | 21,470,852 [20,660,093, 23,678,419] | **14.06%** | 17,168,859 (**below all five**) |
+| Tool&Agent | 0.45 × gap (272.582 ms) | 21,749,039 [19,802,882, 26,329,219] | **30.01%** | below all five |
+
+Spread ratio, small j ÷ large j: **0.33 (Conversation)** and **0.47
+(Tool&Agent)**.
+
+Other columns at small j:
+
+| | PCM B/req spread | hit rate | batch/sched |
+|---|---|---|---|
+| Conversation | 0.26% | 0.0946–0.0977 | 22.382–22.579 |
+| Tool&Agent | 0.80% | 0.3672–0.3678 | 22.239–22.457 |
+
+**Reading, per the rule set before the runs:** on both traces the small-j spread
+is below half the large-j spread. **The spread of (d) HBF B/req depends on j.**
+So every (d) range quoted in report.md must state the j used.
+
+Two further facts. Neither is a conclusion.
+
+- Even at small j the spread is **8.55% / 14.06%, above the 5% replicate
+  threshold**.
+- On Tool&Agent the stock run, 17,168,859, lies below every replicate at
+  **both** jitter sizes. The small-j replicates, 20.7–23.7 M, do not approach it.
+
+### Prelude (b) — (c) replicates
+
+(c) = +PCM, `write_back` + `always`, cap 48, burst mode, j = 0.45 × gap
+(141.168 / 272.582 ms), seeds 1–5. The (b) partner of each seed is
+`s2c_j<k>_c48_b_*`.
+
+| (c), cap 48 | HBF B/req mean [min, max] | spread | PCM B/req mean [min, max] | spread | **(b) → (c) reduction, same seed** | headline (PHASE 9 STEP 3) |
+|---|---|---|---|---|---|---|
+| Conversation | 1,648,399,955 [1,646,584,136, 1,649,811,653] | **0.20%** | 1,722,960,524 [1,721,144,705, 1,724,372,222] | 0.19% | **51.07–51.25%** | 51.10% (inside) |
+| Tool&Agent | 811,342,181 [809,852,469, 811,886,707] | **0.25%** | 885,902,751 [884,413,039, 886,447,276] | 0.23% | **52.02–52.25%** | 52.18% (inside) |
+
+Other columns:
+
+- Hit rate: 0.1638–0.1646 (Conv) and 0.4039–0.4041 (T&A).
+- Batch/sched, mean [min, max]: 23.038 [22.943, 23.073] (Conv) and 22.743
+  [22.622, 22.797] (T&A).
+- **Batch gap (c) vs (b)**, replicate means: −0.63% (Conv) and −0.66% (T&A).
+
+**(c) is replicate-stable.** The write-back halving holds to within 0.25% across
+seeds, and the headline lies inside its replicate range on both traces.
+
+### Prelude (c) — NOTE on the request-mode sensitivity table
+
+**Points back to** "Request-mode jitter as an intra-burst-order SENSITIVITY
+result" (STEP 2b revised).
+
+Those (d) HBF deltas are not readable as effects of intra-burst order. Each
+request-mode mean shift against the clean (j = 0.45 burst) replicate mean is
+inside, or at the edge of, (d)'s own replicate spread:
+
+| cap / trace | request-mode mean vs clean mean | clean spread | request-mode runs outside the clean range |
+|---|---|---|---|
+| 48 Conversation | −11.71% | 25.99% | 1 / 5 |
+| 48 Tool&Agent | −18.16% | 30.01% | 3 / 5 |
+| 256 Conversation | −11.15% | 16.25% | 3 / 5 |
+| 256 Tool&Agent | **−18.88%** | **19.26%** (at the edge) | **5 / 5** |
+
+**Readable from that table:**
+
+- (b)'s hit-rate drop (−2.8% to −3.4%), which is far outside (b)'s ≤ 0.5%
+  replicate spread.
+- The share of continuations moved ahead of their predecessor (11–13% / 27–29%).
+
+**Counter-evidence, recorded so it is not lost:** all four (d) shifts have the
+same sign (−11% to −19%), and 12 of 20 request-mode runs fall outside the clean
+range. That includes all five at T&A cap 256. A consistent direction is
+suggestive. By the spread criterion it is not established.
+
+### Prelude — notes after review (supersede the wording above, which stays as written)
+
+1. **Request-mode note, revised wording.** This replaces the reading in
+   "Prelude (c)". For request-mode jitter, the (d) HBF effect is as follows:
+   **the direction is consistent (lower (d) HBF) and it falls outside the clean
+   range in 12/20 runs; its size is not pinned down.** (b)'s hit-rate drop and
+   the moved-continuation share remain the readable effects.
+2. **Which reference each table uses.**
+
+   | table | deltas are against |
+   |---|---|
+   | STEP 2b revised, "Effect against the stock (file-order) run": (d) +3.67% / −28.98% etc. | the **stock single run** (j = 0) |
+   | Prelude (c) note: −11.71% … −18.88% | the **clean-replicate mean** (burst, j = 0.45 × gap) |
+
+   The two sets of numbers are not comparable with each other. The stock T&A
+   (d) run is itself below every replicate, so a delta against it overstates
+   the shift on that trace.
+3. **T&A's j-dependence is borderline.** Its spread ratio is **0.47**, against
+   the 0.5 cut-off. Conversation's 0.33 is clear. The "depends on j" reading
+   holds for both traces under the rule as written, but on Tool&Agent it is
+   within 0.03 of the cut-off.
+
+## STEP 3 — (d) concurrency sweep with replicates
+
+**Pre-registered reading, fixed before any run:** "batch drives (d) HBF" only if
+(i) the per-cap means move in one direction across caps **and** (ii) the change
+in mean from the lowest to the highest cap exceeds the largest per-cap
+replicate spread. Otherwise "not shown".
+
+**Result: "not shown" on both traces.** The means are **non-monotone** across
+caps on both traces, which fails (i). The cap 8 → cap 256 change is +15.01%
+(Conv) and +2.45% (T&A), against largest per-cap spreads of 23.76% and 20.22%,
+which fails (ii) as well. **But (d) HBF is not flat across caps either.** On
+Tool&Agent, 18 of 28 cap pairs have non-overlapping replicate ranges (see
+"Non-monotone, flagged").
+
+### Why j = 0.05 and not 0.45 (recorded per instruction)
+
+The sweep uses burst jitter at **j = 0.05 × the minimum inter-burst gap**
+(15.685 ms Conv, 30.287 ms T&A), not 0.45. At j = 0.45 the per-cap spread is
+26–30%. That would make "not shown", the answer that supports the paper's
+invariance claim, the easy outcome. **j = 0.05 is the stricter test.** It is a
+methodology choice, not a hardware number.
+
+### Setup
+
+- (d) only, caps {8, 16, 32, 48, 64, 96, 192, 256}, both traces, seeds 1–3:
+  48 runs. Driver `scripts/phase14/step3.sh`, table
+  `scripts/phase14/step3_table.py`.
+- 30 QPS, W = 5,000, charged timing, stock values, otherwise as STEP 0.
+  `notdone = 0` in all runs.
+- **The cap-48 runs reproduce `p3_js{1,2,3}_d_*` byte for byte** (stripped
+  diff empty, all six).
+- Conversation caps 192 and 256 are byte-identical per seed, because the cap
+  stops binding. PHASE 9 found the same for (b).
+
+**(b) is not rerun, as agreed.** Burst jitter moves (b) HBF by at most 0.15%
+(STEP 2b revised), so the stock PHASE 9 STEP 4 rows are reused. The exception
+is **Tool&Agent caps 192 and 256, which PHASE 9 STEP 4 never ran**:
+
+- cap 256 is `s1_b256_ta` (STEP 1e, which reproduces PHASE 9 STEP 3 revised);
+- cap 192 is a new stock run, `s3_b192_ta`: 1,684,909,064 B/req, batch 47.87.
+
+The (b) batch figures from PHASE 9 STEP 4 are recorded there to 2 dp only.
+
+### Conversation — (d), j = 0.05 x min gap, 3 seeds per cap
+
+| cap | (d) HBF B/req mean [min, max] | spread | (d) PCM B/req mean [min, max] | hit rate [min, max] | (d) batch/sched mean [min, max] | (b) HBF B/req | (b) batch | (b)->(d) reduction | batch gap (d) vs (b) | (b) source |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 35,062,983 [34,280,047, 35,605,447] | 3.78% | 1,993,435,251 [1,991,602,340, 1,995,988,533] | [0.0969, 0.0985] | 3.927 [3.923, 3.935] | 3,377,115,693 | 3.94 | 98.95–98.98% | -0.33% | PHASE 9 STEP 4 |
+| 16 | 34,621,533 [34,212,938, 35,103,179] | 2.57% | 1,992,957,450 [1,992,391,918, 1,993,310,470] | [0.0956, 0.0960] | 7.692 [7.690, 7.693] | 3,370,987,815 | 7.83 | 98.96–98.99% | -1.77% | PHASE 9 STEP 4 |
+| 32 | 39,260,433 [35,370,566, 41,213,755] | 14.88% | 1,991,402,761 [1,986,555,019, 2,000,733,340] | [0.0919, 0.0960] | 15.036 [14.978, 15.147] | 3,383,093,625 | 15.46 | 98.78–98.95% | -2.74% | PHASE 9 STEP 4 |
+| 48 | 40,731,236 [39,653,474, 41,851,290] | 5.40% | 1,989,226,791 [1,987,605,168, 1,990,650,757] | [0.0948, 0.0977] | 22.491 [22.382, 22.579] | 3,370,675,339 | 23.17 | 98.76–98.82% | -2.92% | PHASE 9 STEP 4 |
+| 64 | 35,491,152 [32,770,097, 38,093,193] | 15.00% | 1,995,854,665 [1,991,621,214, 1,998,590,050] | [0.0933, 0.0951] | 29.701 [29.635, 29.776] | 3,376,704,651 | 30.81 | 98.87–99.03% | -3.60% | PHASE 9 STEP 4 |
+| 96 | 37,733,881 [35,269,378, 39,067,320] | 10.07% | 1,991,804,365 [1,986,854,388, 1,998,140,735] | [0.0914, 0.0963] | 40.587 [40.333, 40.947] | 3,385,003,082 | 42.16 | 98.85–98.96% | -3.73% | PHASE 9 STEP 4 |
+| 192 | 40,325,612 [34,849,948, 44,431,311] | 23.76% | 1,988,299,850 [1,980,956,148, 1,997,772,161] | [0.0913, 0.0983] | 41.833 [41.606, 42.049] | 3,387,654,930 | 43.61 | 98.69–98.97% | -4.08% | PHASE 9 STEP 4 |
+| 256 | 40,325,612 [34,849,948, 44,431,311] | 23.76% | 1,988,299,850 [1,980,956,148, 1,997,772,161] | [0.0913, 0.0983] | 41.833 [41.606, 42.049] | 3,387,654,930 | 43.61 | 98.69–98.97% | -4.08% | PHASE 9 STEP 4 |
+
+means move in one direction: no (signs of cap-to-cap steps: -++-++-); cap 8 -> cap 256 change in mean: +15.01%; largest per-cap spread: 23.76% (cap 192); extreme means: min 34,621,533 (cap 16), max 40,731,236 (cap 48) -> not shown
+
+### Tool&Agent — (d), j = 0.05 x min gap, 3 seeds per cap
+
+| cap | (d) HBF B/req mean [min, max] | spread | (d) PCM B/req mean [min, max] | hit rate [min, max] | (d) batch/sched mean [min, max] | (b) HBF B/req | (b) batch | (b)->(d) reduction | batch gap (d) vs (b) | (b) source |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 26,966,753 [24,148,181, 28,459,926] | 15.99% | 997,260,438 [995,666,952, 1,000,145,945] | [0.3691, 0.3695] | 3.881 [3.877, 3.884] | 1,696,587,055 | 3.90 | 98.32–98.58% | -0.49% | PHASE 9 STEP 4 |
+| 16 | 23,505,753 [22,996,320, 23,963,632] | 4.12% | 999,009,463 [998,725,124, 999,359,513] | [0.3684, 0.3685] | 7.614 [7.604, 7.628] | 1,697,241,367 | 7.75 | 98.59–98.65% | -1.76% | PHASE 9 STEP 4 |
+| 32 | 24,399,839 [22,638,232, 27,570,733] | 20.22% | 998,791,883 [995,901,309, 1,000,833,810] | [0.3664, 0.3677] | 15.060 [15.043, 15.088] | 1,695,311,987 | 15.29 | 98.37–98.66% | -1.50% | PHASE 9 STEP 4 |
+| 48 | 21,777,525 [20,660,093, 23,678,419] | 13.86% | 1,000,152,061 [998,507,020, 1,003,026,383] | [0.3672, 0.3677] | 22.374 [22.239, 22.457] | 1,696,787,333 | 22.89 | 98.60–98.78% | -2.24% | PHASE 9 STEP 4 |
+| 64 | 19,657,480 [18,947,244, 20,356,530] | 7.17% | 1,007,766,121 [1,006,485,111, 1,008,767,336] | [0.3641, 0.3641] | 29.580 [29.566, 29.603] | 1,697,208,861 | 30.38 | 98.80–98.88% | -2.63% | PHASE 9 STEP 4 |
+| 96 | 26,475,321 [26,033,521, 26,738,164] | 2.66% | 995,847,307 [995,584,115, 996,273,029] | [0.3700, 0.3701] | 40.905 [40.780, 41.149] | 1,678,879,752 | 43.03 | 98.41–98.45% | -4.94% | PHASE 9 STEP 4 |
+| 192 | 25,144,328 [24,674,566, 25,614,090] | 3.74% | 999,081,465 [998,574,653, 999,394,640] | [0.3686, 0.3692] | 45.446 [45.380, 45.551] | 1,684,909,064 | 47.87 | 98.48–98.54% | -5.06% | s3_b192_ta |
+| 256 | 27,626,657 [26,855,604, 28,020,572] | 4.22% | 994,657,348 [992,700,531, 995,653,321] | [0.3724, 0.3733] | 45.240 [45.202, 45.261] | 1,695,909,675 | 48.44 | 98.35–98.42% | -6.60% | s1_b256_ta |
+
+means move in one direction: no (signs of cap-to-cap steps: -+--+-+); cap 8 -> cap 256 change in mean: +2.45%; largest per-cap spread: 20.22% (cap 32); extreme means: min 19,657,480 (cap 64), max 27,626,657 (cap 256) -> not shown
+
+### Batch mismatch — flagged
+
+The (d)-vs-(b) batch gap grows with cap:
+
+- **Conversation:** −0.33% at cap 8 to −4.08% at caps 192/256.
+- **Tool&Agent:** −0.49% at cap 8 to **−6.60%** at cap 256.
+
+From cap 64 upward (d) also reaches 98.8–99.2% peak HBM occupancy, the same as
+(b) in PHASE 9:
+
+| cap | 8 | 16 | 32 | 48 | 64 | 96 | 192 | 256 |
+|---|---|---|---|---|---|---|---|---|
+| Conv (d) peak HBM, max over seeds | 29.1% | 37.6% | 67.9% | 91.7% | 99.0% | 99.2% | 99.1% | 99.1% |
+| T&A (d) peak HBM, max over seeds | 33.6% | 40.8% | 60.0% | 79.5% | 98.8% | 99.2% | 99.2% | 99.2% |
+
+### Non-monotone, flagged (not smoothed)
+
+| | range of per-cap means (max ÷ min − 1) | cap pairs whose 3-seed ranges do not overlap |
+|---|---|---|
+| Conversation | 17.65% (cap 16 → cap 48) | 6 / 28 |
+| Tool&Agent | **40.54%** (cap 64 → cap 256) | **18 / 28** |
+
+On Tool&Agent the mean falls from cap 8 to cap 64, then jumps at cap 96. Cap 64
+(19.66 M, range 18.95–20.36 M) and cap 256 (27.63 M, range 26.86–28.02 M) do not
+overlap.
+
+Two caveats on reading that:
+
+- With 3 seeds per cap, a non-overlapping range is weak evidence.
+- The pattern is not monotone, so the rule's "batch drives" reading does not
+  apply.
+
+**What can be said:** (d)'s HBF write volume **varies with cap by more than its
+replicate spread on Tool&Agent, non-monotonically.** That is not the
+"concurrency-invariant" behaviour PHASE 9 STEP 4 showed for (b) and (c).
+
+**The (b) → (d) reduction, by contrast, stays within 98.32–98.88% (T&A) and
+98.69–98.99% (Conv) at every cap.**
+
+### Second view — the j = 0.45 end points (STEP 2b revised), labelled with their j
+
+At **j = 0.45 × gap**, 5 seeds, (d) T&A:
+
+- cap 48: 19.8–26.3 M, spread 30.01%
+- cap 256: 22.9–27.8 M, spread 19.26%
+- the replicate means differ by **+17.56%**, inside both spreads, and the ranges
+  overlap
+
+At j = 0.05 the same two caps give +26.86% between means (21.78 M → 27.63 M).
+That exceeds both of those caps' own spreads (13.86% and 4.22%), and their
+ranges do not overlap. But it is not monotone across the intervening caps.
+
+## Extra check — j = 0.005 × min gap: do the replicates approach the stock run?
+
+(d), cap 48, burst mode, **j = 0.005 × min gap = 1.569 ms (Conv), 3.029 ms
+(T&A)**, seeds 1–5 (`s3_jt*`). This is a methodology choice, not a hardware
+number.
+
+| (d) HBF B/req, cap 48 | j | values (seeds 1–5) | mean [min, max] | spread |
+|---|---|---|---|---|
+| Conversation | 0.005 × gap | 43,025,695 · 41,566,077 · 43,025,695 · 42,772,464 · **41,901,621** | 42,458,310 [41,566,077, 43,025,695] | 3.44% |
+| Conversation | 0.05 × gap | — | 40,021,629 [38,428,738, 41,851,290] | 8.55% |
+| Conversation | 0.45 × gap | — | 37,965,477 [32,048,677, 41,914,728] | 25.99% |
+| Tool&Agent | 0.005 × gap | 17,185,636 · 20,759,183 · 23,544,201 · **17,168,859** · 17,185,636 | 19,168,703 [17,168,859, 23,544,201] | **33.26%** |
+| Tool&Agent | 0.05 × gap | — | 21,470,852 [20,660,093, 23,678,419] | 14.06% |
+| Tool&Agent | 0.45 × gap | — | 21,749,039 [19,802,882, 26,329,219] | 30.01% |
+
+Stock (j = 0): Conversation 41,901,621; Tool&Agent 17,168,859.
+
+**Answer: at j = 0.005 the replicates reach the stock run. They do not stay with
+the j = 0.05 range.**
+
+- **Tool&Agent seed 4** reproduces the stock store outcome exactly. HBF and PCM
+  write blocks, hit rate, reuse hit blocks, demoted/dropped, batch and duration
+  are all identical; the stripped results differ in 8 lines of
+  latency/timing detail. Seeds 1 and 5 land 32 blocks away (17,185,636 B/req).
+- **Conversation seed 5** reproduces the stock store counters exactly. Batch
+  and duration differ in the 5th significant figure.
+- **The outcomes are discrete.** Repeated values appear across seeds
+  (43,025,695 twice on Conv; 17,185,636 twice on T&A). A small arrival
+  perturbation either leaves the store trajectory exactly where the stock run
+  put it, or flips it to another of a few states.
+- **Spread against j is not monotone on Tool&Agent:** 33.26% → 14.06% → 30.01%
+  for j = 0.005 → 0.05 → 0.45. That weakens the prelude's "spread depends on j"
+  reading for T&A, which was already borderline (ratio 0.47). On Conversation
+  the spread does grow with j: 3.44% → 8.55% → 25.99%.
+
+**Candidate, not a finding: the stock replay is a perfectly periodic burst
+train.** Replay-time gaps are 313.706–313.915 ms (Conv) and 605.737–606.141 ms
+(T&A), and that periodicity could be why the stock run sits outside every
+j ≥ 0.05 replicate. The j = 0.005 data bear on it without settling it:
+
+- The stock store outcome is reproduced exactly under a **non-periodic** train
+  (T&A seed 4, ±3.029 ms offsets). So exact periodicity is **not necessary** for
+  it.
+- What the data do show is that the stock outcome is one of several discrete
+  states. It is common at very small perturbations and rare at larger ones.
+
+### Settings
+
+| | |
+|---|---|
+| runs | `tmp/phase14/runs/s3_c{8,…,256}_s{1,2,3}_d_{conv,ta}` (48), `s3_jt{1..5}_d_{conv,ta}` (10), `s3_b192_ta` (1, stock (b)) |
+| scripts | `scripts/phase14/step3.sh`, `step3_table.py`; `burst_gaps.py` for the j values |
+| hardware | none invented or changed |
+
+## STEP 3 — pooled (d) bound at cap 48, and corrections (docs/analysis only, no new runs)
+
+### Pooled (d), cap 48
+
+Every distinct (d) cap-48 run in this phase: the stock run, and the burst-jitter
+replicates at j = 0.005, 0.05 and 0.45 × min inter-burst gap. Excluded:
+
+- byte-identical duplicates: `s3_c48_s{1,2,3}` = `p3_js{1,2,3}`, and the
+  stock-identical `s2_id`, `s2_ref`, `s2b_id`, `s2c_id`;
+- request-mode runs, a workload variant;
+- the STEP 2 timing arms, which are listed separately below.
+
+(b) for each reduction is the same-seed (b) where one exists (j = 0.45).
+Otherwise it is the stock (b) run; burst jitter moves (b) HBF by ≤ 0.15%.
+
+#### Conversation
+
+| run | (d) HBF B/req | (b) HBF B/req (source) | (b) → (d) reduction | b ÷ d |
+|---|---|---|---|---|
+| stock (j = 0) | 41,901,621 | 3,370,675,339 (stock (b)) | 98.76% | ×80.4 |
+| j = 0.005 × gap, seed 1 | 43,025,695 | 3,370,675,339 (stock (b)) | 98.72% | ×78.3 |
+| j = 0.005 × gap, seed 2 | 41,566,077 | 3,370,675,339 (stock (b)) | 98.77% | ×81.1 |
+| j = 0.005 × gap, seed 3 | 43,025,695 | 3,370,675,339 (stock (b)) | 98.72% | ×78.3 |
+| j = 0.005 × gap, seed 4 | 42,772,464 | 3,370,675,339 (stock (b)) | 98.73% | ×78.8 |
+| j = 0.005 × gap, seed 5 | 41,901,621 | 3,370,675,339 (stock (b)) | 98.76% | ×80.4 |
+| j = 0.05 × gap, seed 1 | 41,851,290 | 3,370,675,339 (stock (b)) | 98.76% | ×80.5 |
+| j = 0.05 × gap, seed 2 | 39,653,474 | 3,370,675,339 (stock (b)) | 98.82% | ×85.0 |
+| j = 0.05 × gap, seed 3 | 40,688,943 | 3,370,675,339 (stock (b)) | 98.79% | ×82.8 |
+| j = 0.05 × gap, seed 4 | 38,428,738 | 3,370,675,339 (stock (b)) | 98.86% | ×87.7 |
+| j = 0.05 × gap, seed 5 | 39,485,702 | 3,370,675,339 (stock (b)) | 98.83% | ×85.4 |
+| j = 0.45 × gap, seed 1 | 37,824,758 | 3,375,079,358 (same-seed (b)) | 98.88% | ×89.2 |
+| j = 0.45 × gap, seed 2 | 39,766,196 | 3,377,824,530 (same-seed (b)) | 98.82% | ×84.9 |
+| j = 0.45 × gap, seed 3 | 32,048,677 | 3,370,120,643 (same-seed (b)) | 99.05% | ×105.2 |
+| j = 0.45 × gap, seed 4 | 41,914,728 | 3,373,242,253 (same-seed (b)) | 98.76% | ×80.5 |
+| j = 0.45 × gap, seed 5 | 38,273,024 | 3,372,436,947 (same-seed (b)) | 98.87% | ×88.1 |
+
+#### Tool&Agent
+
+| run | (d) HBF B/req | (b) HBF B/req (source) | (b) → (d) reduction | b ÷ d |
+|---|---|---|---|---|
+| stock (j = 0) | 17,168,859 | 1,696,787,333 (stock (b)) | 98.99% | ×98.8 |
+| j = 0.005 × gap, seed 1 | 17,185,636 | 1,696,787,333 (stock (b)) | 98.99% | ×98.7 |
+| j = 0.005 × gap, seed 2 | 20,759,183 | 1,696,787,333 (stock (b)) | 98.78% | ×81.7 |
+| j = 0.005 × gap, seed 3 | 23,544,201 | 1,696,787,333 (stock (b)) | 98.61% | ×72.1 |
+| j = 0.005 × gap, seed 4 | 17,168,859 | 1,696,787,333 (stock (b)) | 98.99% | ×98.8 |
+| j = 0.005 × gap, seed 5 | 17,185,636 | 1,696,787,333 (stock (b)) | 98.99% | ×98.7 |
+| j = 0.05 × gap, seed 1 | 20,660,093 | 1,696,787,333 (stock (b)) | 98.78% | ×82.1 |
+| j = 0.05 × gap, seed 2 | 20,994,064 | 1,696,787,333 (stock (b)) | 98.76% | ×80.8 |
+| j = 0.05 × gap, seed 3 | 23,678,419 | 1,696,787,333 (stock (b)) | 98.60% | ×71.7 |
+| j = 0.05 × gap, seed 4 | 20,859,847 | 1,696,787,333 (stock (b)) | 98.77% | ×81.3 |
+| j = 0.05 × gap, seed 5 | 21,161,837 | 1,696,787,333 (stock (b)) | 98.75% | ×80.2 |
+| j = 0.45 × gap, seed 1 | 26,329,219 | 1,691,782,480 (same-seed (b)) | 98.44% | ×64.3 |
+| j = 0.45 × gap, seed 2 | 20,373,307 | 1,694,342,054 (same-seed (b)) | 98.80% | ×83.2 |
+| j = 0.45 × gap, seed 3 | 21,279,277 | 1,698,942,157 (same-seed (b)) | 98.75% | ×79.8 |
+| j = 0.45 × gap, seed 4 | 20,960,510 | 1,699,508,388 (same-seed (b)) | 98.77% | ×81.1 |
+| j = 0.45 × gap, seed 5 | 19,802,882 | 1,697,334,690 (same-seed (b)) | 98.83% | ×85.7 |
+
+#### Pooled bound
+
+| | **N** | (d) HBF B/req min – max | **worst-case reduction** | best-case reduction | b ÷ d range |
+|---|---|---|---|---|---|
+| **Conversation** | **16** | 32,048,677 – 43,025,695 | **98.72%** | 99.05% | ×78.3 – ×105.2 |
+| **Tool&Agent** | **16** | 17,168,859 – 26,329,219 | **98.44%** | 98.99% | ×64.3 – ×98.8 |
+
+#### STEP 2 timing arms, listed separately
+
+These are not part of the pooled bound: each changes a timing knob, so it is not
+a replicate. Each arm uses its own same-arm (b).
+
+| arm | Conv (d) HBF B/req | Conv reduction | Conv b ÷ d | T&A (d) HBF B/req | T&A reduction | T&A b ÷ d |
+|---|---|---|---|---|---|---|
+| free | 38,407,242 | 98.86% | ×87.9 | 20,088,095 | 98.82% | ×84.4 |
+| ssd | 41,465,414 | 98.77% | ×81.3 | 17,907,057 | 98.94% | ×94.8 |
+| plat025 | 38,445,515 | 98.86% | ×87.7 | 24,299,176 | 98.57% | ×69.8 |
+| plat4 | 38,440,796 | 98.86% | ×87.7 | 23,074,439 | 98.64% | ×73.5 |
+| pbw025 | 37,316,198 | 98.89% | ×90.3 | 26,959,938 | 98.41% | ×62.9 |
+| pbw4 | 40,693,662 | 98.79% | ×82.8 | 23,460,315 | 98.62% | ×72.3 |
+
+The timing arms widen T&A's worst case to 98.41% (`pbw025`). They do not widen
+Conversation's.
+
+**Candidate, not a finding: outcomes cluster on a few discrete values.**
+Exact repeats among the 16 pooled runs:
+
+- **Conversation:** 43,025,695 (twice, j = 0.005 seeds 1 and 3) and 41,901,621
+  (stock, and j = 0.005 seed 5).
+- **Tool&Agent:** 17,185,636 (twice, j = 0.005 seeds 1 and 5) and 17,168,859
+  (stock, and j = 0.005 seed 4).
+
+All repeats occur at the smallest j. With 16 runs per trace this is suggestive
+only.
+
+### Corrections to STEP 3 (the text above stays as written)
+
+1. **The periodic-burst-train candidate is not supported.** A non-periodic
+   train reproduces the stock store outcome exactly: T&A, j = 0.005, seed 4.
+   Exact periodicity is therefore not what places the stock run outside the
+   j ≥ 0.05 replicates.
+2. **T&A's j-dependence call is withdrawn.** Its spread is non-monotone in j:
+   **33.26% / 14.06% / 30.01%** at j = 0.005 / 0.05 / 0.45. The prelude's "the
+   spread depends on j" now stands for Conversation only (3.44% / 8.55% /
+   25.99%, monotone). Every (d) range is still quoted with its j.
+3. **The j = 0.05 cap 48 → 256 gap on T&A (+26.86%) is part of a non-monotone
+   swing, not a batch effect.** The per-cap means fall from cap 8 to cap 64
+   and rise again from cap 96 (STEP 3 table). A two-point difference picked
+   from that series is not evidence of a batch dependence.
+
+### Pooled bound — addendum: the worst case over every cap tested
+
+The pooled bound above is cap-48 only. Over all 46 (d) runs per trace at every
+cap tested, the worst-case (b) → (d) reduction is lower:
+
+- Conversation: **98.66%** (`s2c_j3_c256`).
+- Tool&Agent: **98.28%** (the stock cap-256 run).
+
+These runs are the stock runs, the j = 0.005 / 0.05 / 0.45 replicates at cap 48
+and 256, and the STEP 3 sweep. Residual (d) HBF B/req across them spans
+32.0–45.4 M (+41.8%) on Conversation and 17.2–29.2 M (+70.1%) on Tool&Agent.
+report.md's Pending LaTeX sync uses these all-cap figures.
+
+## STEP 3a — Cross-rank eviction in the shared store
+
+### The flag
+
+| flag | values | where |
+|---|---|---|
+| **`store_partition`** | **`global`** (default, stock) \| `count` \| `per_rank` | `mooncake/config.py` (validated in `__post_init__`) |
+| **`store_partition_ranks`** | required for `per_rank`, **no default**; must equal the world size (checked in the connector) | `mooncake/config.py`; `MooncakeStoreConnector._check_partition_ranks` |
+
+**A rank is the key's (tp_rank, pp_rank, dp_rank),** read from
+`PoolKey.key_metadata`. The modes:
+
+- **`count`** records each memory-tier object's rank. It counts memory-tier
+  evictions where the victim's rank differs from the rank of the admission
+  that forced them. It tracks each rank's peak memory-tier occupancy. Nothing
+  else changes.
+- **`per_rank`** gives each rank its own memory-tier LRU and capacity
+  (`_ensure_rank_capacity`, `_rank_lru`), and its own offload tier
+  (`PartitionedOffloadTier`, `mooncake/ssd.py`). Capacities are **floored**:
+  - PCM: floor(142,213 / 8) = **17,776 blocks per rank**, 5 blocks unused.
+  - HBF: floor(10,066,329 / 8) = **1,258,291 blocks per rank**, 1 block unused.
+
+  Note that 17,776 here is the per-GPU design value applied per rank. It is
+  **not** the "17,776-block control" of `CLAUDE.md`: the pool knob stays
+  `memory_capacity_blocks = 142213`.
+
+Counters (`partition_*`) are merged after `asdict()`. The non-stock mode is
+recorded in `mooncake_offload_profiles`.
+
+**Byte identity at default:** `s3a_id_{b,d}_{conv,ta}` against `ced3806` →
+**no diff, all four.** For (c), with no cap-48 result left on disk, the
+default-code run `s3a_def_c_*` reproduces PHASE 9 STEP 3's recorded values
+exactly:
+
+| | HBF write bytes | HBF blocks | hit rate | reuse hit blocks | batch |
+|---|---|---|---|---|---|
+| Conversation | 8,240,926,556,160 | 3,143,664 | 0.1645 | 671,266 | 23.08 |
+| Tool&Agent | 4,057,074,237,440 | 1,547,651 | 0.4040 | 1,174,945 | 22.64 |
+
+**`count` is behaviourally stock:** against stock, (b), (c) and (d) on both
+traces have no differing non-counter field. **Tests: 236 pass** (221 + 15 new
+in `tests/test_store_partition.py`).
+
+### Runs
+
+(b), (c), (d), cap 48, 30 QPS, W = 5,000, unjittered, charged timing, stock
+values. Driver `scripts/phase14/step3a.sh`, table
+`scripts/phase14/step3a_table.py`.
+
+### Conversation
+
+| config | mode | HBF B/req | Δ vs stock | PCM B/req | Δ | hit rate | Δ | reuse hit blk | memory evictions | cross-rank / same-rank | cross-rank share | per-rank peak blk min / max | ssd evictions | batch/sched | batch gap vs stock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | stock | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | +0.00% | 670,585 | 3,143,420 | — | — | — | 0 | 23.1679 | +0.00% |
+| (b) | count | 3,370,675,339 | +0.00% | 1,722,617,954 | +0.00% | 0.1643 | +0.00% | 670,585 | 3,143,420 | 2,373,254 / 770,166 | 75.50% | 42,933 / 54,093 | 0 | 23.1679 | +0.00% |
+| (b) | per_rank | 3,418,975,371 | +1.43% | 1,728,127,173 | +0.32% | 0.1648 | +0.29% | 672,505 | 3,225,037 | 0 / 3,225,037 | 0.00% | 17,776 / 17,776 | 0 | 23.2174 | +0.21% |
+| (c) | stock | 1,648,185,311 | +0.00% | 1,722,745,881 | +0.00% | 0.1645 | +0.00% | 671,266 | 3,143,664 | — | — | — | 0 | 23.0768 | +0.00% |
+| (c) | count | 1,648,185,311 | +0.00% | 1,722,745,881 | +0.00% | 0.1645 | +0.00% | 671,266 | 3,143,664 | 2,314,646 / 829,018 | 73.63% | 43,197 / 50,528 | 0 | 23.0768 | +0.00% |
+| (c) | per_rank | 1,681,900,700 | +2.05% | 1,719,179,674 | -0.21% | 0.1645 | -0.01% | 671,202 | 3,207,971 | 0 / 3,207,971 | 0.00% | 17,776 / 17,776 | 0 | 23.0033 | -0.32% |
+| (d) | stock | 41,901,621 | +0.00% | 1,987,125,969 | +0.00% | 0.0974 | +0.00% | 397,596 | 3,647,929 | — | — | — | 0 | 22.3782 | +0.00% |
+| (d) | count | 41,901,621 | +0.00% | 1,987,125,969 | +0.00% | 0.0974 | +0.00% | 397,596 | 3,647,929 | 2,756,168 / 891,761 | 75.55% | 45,509 / 71,892 | 0 | 22.3782 | +0.00% |
+| (d) | per_rank | 10,543,432 (**outside pooled range**) | -74.84% | 2,042,432,061 | +2.78% | 0.0926 | -4.95% | 377,916 | 3,824,526 | 0 / 3,824,526 | 0.00% | 17,776 / 17,776 | 0 | 22.4946 | +0.52% |
+
+
+### Tool&Agent
+
+| config | mode | HBF B/req | Δ vs stock | PCM B/req | Δ | hit rate | Δ | reuse hit blk | memory evictions | cross-rank / same-rank | cross-rank share | per-rank peak blk min / max | ssd evictions | batch/sched | batch gap vs stock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | stock | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | +0.00% | 1,174,042 | 1,547,076 | — | — | — | 0 | 22.8850 | +0.00% |
+| (b) | count | 1,696,787,333 | +0.00% | 885,673,951 | +0.00% | 0.4037 | +0.00% | 1,174,042 | 1,547,076 | 1,151,459 / 395,617 | 74.43% | 40,798 / 48,424 | 0 | 22.8850 | +0.00% |
+| (b) | per_rank | 1,729,667,006 | +1.94% | 883,472,990 | -0.25% | 0.4036 | -0.01% | 1,173,911 | 1,613,987 | 0 / 1,613,987 | 0.00% | 17,776 / 17,776 | 0 | 22.9836 | +0.43% |
+| (c) | stock | 811,414,847 | +0.00% | 885,975,417 | +0.00% | 0.4040 | +0.00% | 1,174,945 | 1,547,651 | — | — | — | 0 | 22.6431 | +0.00% |
+| (c) | count | 811,414,847 | +0.00% | 885,975,417 | +0.00% | 0.4040 | +0.00% | 1,174,945 | 1,547,651 | 1,145,753 / 401,898 | 74.03% | 39,925 / 54,241 | 0 | 22.6431 | +0.00% |
+| (c) | per_rank | 847,666,217 | +4.47% | 884,945,191 | -0.12% | 0.4040 | +0.01% | 1,175,105 | 1,616,795 | 0 / 1,616,795 | 0.00% | 17,776 / 17,776 | 0 | 22.8503 | +0.92% |
+| (d) | stock | 17,168,859 | +0.00% | 1,001,932,194 | +0.00% | 0.3650 | +0.00% | 1,061,727 | 1,768,821 | — | — | — | 0 | 22.4295 | +0.00% |
+| (d) | count | 17,168,859 | +0.00% | 1,001,932,194 | +0.00% | 0.3650 | +0.00% | 1,061,727 | 1,768,821 | 1,343,086 / 425,735 | 75.93% | 41,694 / 54,749 | 0 | 22.4295 | +0.00% |
+| (d) | per_rank | 4,082,631 (**outside pooled range**) | -76.22% | 1,024,847,249 | +2.29% | 0.3671 | +0.56% | 1,067,647 | 1,883,637 | 0 / 1,883,637 | 0.00% | 17,776 / 17,776 | 0 | 22.4478 | +0.08% |
+
+
+`per_rank` capacities: 17,776 PCM blocks and 1,258,291 HBF blocks per rank.
+**Ranks seen: 4** (see the constraint below). `ssd_eviction_count = 0` in all
+18 runs. **Batch gap vs stock:** `count` 0.00% in all six. `per_rank` −0.32%
+to +0.92%.
+
+### CONSTRAINT found in this step: only TP-rank-0 workers are scheduled; 4 of 8 ranks ever write to the store
+
+**What the code does.** `LLMEngine._is_schedulable_worker`
+(`TokenSim/llm/llm_engine.py:577-579`) returns `tp_rank == 0 and pp_rank == 0`
+whenever `world_size > 1`. Only those workers enter the prefill and decode
+pools. At TP2/DP4 that is **4 of the 8 workers**, one per DP group.
+
+The TP-rank-1 workers never receive a request, never allocate HBM and never
+call the connector. Measured:
+
+- `partition_ranks_seen = 4` in every `count` and `per_rank` run.
+- Per-rank peaks are listed for 4 ranks only, e.g. 47,412 / 42,933 / 52,318 /
+  54,093 blocks in (b) Conversation.
+- `batch_peak_cluster = 192` = 4 × 48 at cap 48.
+
+**Consequence 1 — every "batch/sched" figure in this file is half the
+active-scheduler batch.** `get_batch_stats` (`util/results.py:359-395`)
+divides by all 8 workers that own a block manager, including the 4 idle ones.
+Same-config gaps and every ratio between arms are unaffected, because they
+share the denominator. Absolute values are not:
+
+| run | reported batch/sched (÷ 8) | **per active scheduler (÷ 4)** | reported HBM mean | **HBM mean over active ranks** (inferred: idle ranks hold 0) |
+|---|---|---|---|---|
+| (b) Conv cap 48 | 23.168 | **46.336** | 26.43% | **52.86%** |
+| (d) Conv cap 48 | 22.378 | **44.756** | 25.39% | **50.78%** |
+| (b) T&A cap 48 | 22.885 | **45.770** | 25.41% | **50.83%** |
+| (d) T&A cap 48 | 22.430 | **44.859** | 25.12% | **50.25%** |
+| (b) Conv cap 256 | 43.609 | **87.218** | 46.90% | **93.80%** |
+| (b) T&A cap 256 | 48.437 | **96.874** | 45.68% | **91.36%** |
+
+So at cap 48 the active schedulers run at **~93–97% of the cap on average**,
+not ~47%. PHASE 9 STEP 1's "8 schedulers, so cluster concurrency is
+8 × max_parallem_sum" should read **4 ×**. Peak HBM occupancy is a max over
+workers and is unaffected.
+
+**Consequence 2 — the PCM pool sees half the shards it was sized for.** The
+block size, 2,621,440 B, is one **TP shard**: TP2 splits the KV heads. In the
+real system both TP ranks of a DP group hold, and would save, their shard. In
+the simulator only the TP-0 shard reaches the store. Yet the pool is sized for
+**all 8 GPUs**: 142,213 shard-blocks = 43.4 GiB × 8. So:
+
+- **The PCM capacity relative to its write stream is 2× the design.** Each
+  writing rank peaks at 41,694–54,749 blocks under `global`/`count`, against a
+  per-GPU design share of 17,776.
+- **HBF and PCM bytes/request are one TP shard's worth.** On the TP-0-only
+  model a real TP2 deployment writes 2× these bytes. Every reduction
+  percentage and every within-config comparison is unaffected in kind, but
+  absolute bytes are halved.
+
+This is a capacity-bookkeeping question of the kind `CLAUDE.md` flags as
+not-negotiable, so it is reported here as a **constraint, not worked around**.
+No run in this file is re-interpreted on its strength yet.
+
+### What `per_rank` actually measured
+
+Because only 4 ranks exist, `per_rank` at 8 partitions gave each writing rank
+its per-GPU 17,776 blocks and left the other 4 partitions empty. **The usable
+PCM capacity was therefore 71,104 blocks, half the pool.** The HBF partitions,
+at 1,258,291 blocks per rank, are never full: 0 HBF evictions. So the `per_rank`
+arm changes two things at once:
+
+1. it removes cross-rank sharing (by construction: 0 cross-rank evictions);
+2. it halves the usable PCM capacity.
+
+The two cannot be separated from these runs.
+
+**Numbers, read per the rule set before the runs** (single runs readable for
+(b), (c), all PCM and hit rate; (d) HBF only outside the pooled cap-48 range):
+
+| | Conversation | Tool&Agent | readable? |
+|---|---|---|---|
+| **cross-rank share of memory-tier evictions (`count`)** | (b) 75.50%, (c) 73.63%, (d) 75.55% | (b) 74.43%, (c) 74.03%, (d) 75.93% | yes (counter) |
+| per-rank peak occupancy, min / max (`count`) | 42,933–54,093 (b) | 40,798–48,424 (b) | yes |
+| (b) HBF B/req, `per_rank` vs stock | +1.43% | +1.94% | yes |
+| (c) HBF B/req, `per_rank` vs stock | +2.05% | +4.47% | yes |
+| PCM B/req, `per_rank` vs stock | +0.32% / −0.21% / +2.78% | −0.25% / −0.12% / +2.29% | yes |
+| hit rate, `per_rank` vs stock | +0.29% / −0.01% / **−4.95%** | −0.01% / +0.01% / +0.56% | yes |
+| **(d) HBF B/req, `per_rank`** | **10,543,432 (−74.84%)** | **4,082,631 (−76.22%)** | **outside the pooled range** (32.0–43.0 M / 17.2–26.3 M) → an effect |
+
+Cross-rank eviction is **the majority**: about 74–76% of all memory-tier
+evictions, in every config on both traces. With 4 equally loaded ranks, a
+rank-blind LRU would give 75% by chance, and the measured shares sit at that
+value.
+
+**(d)'s HBF drop under `per_rank` is an effect by the pre-registered rule.** It
+cannot be attributed to cross-rank sharing, because usable capacity halved at
+the same time. Fewer blocks survive in PCM until their first read, so more are
+dropped by `if_read` instead of demoted. This matches (d)'s lower hit rate on
+Conversation, −4.95%.
+
+### Not concluded — needs a decision
+
+Whether the pool should be compared at "8 partitions, 4 used" or "4 partitions"
+depends on how the TP-0-only model is meant to map to the hardware. That
+mapping is consequence 2 above. It is left open here.
+
+### Settings
+
+| | |
+|---|---|
+| code | **`cd62320`** on `phase14-fixes` |
+| runs | `tmp/phase14/runs/s3a_{id,def,cnt,pr}_*` (18) |
+| hardware | none invented or changed; per-rank capacities are floor(pool / 8) of the sourced pools |
+
+## STEP 3a — control runs: every tier sized for the 4 store-writing ranks
+
+**Decision (after review): option (B).** Only TP-0/PP-0 workers are scheduled
+(`llm_engine.py:577-579`), so 4 of 8 ranks write to the store. **The TP-1
+stream is an exact mirror of TP-0 and is not simulated.** Every tier is
+therefore sized for the 4 writing ranks:
+
+| tier | per writing GPU | × 4 writing ranks | blocks |
+|---|---|---|---|
+| PCM | 43.4 GiB (the design input; findings ~1997 / ~2769) | 173.6 GiB | **4 × 17,776 = 71,104** |
+| HBF | 3 TiB = 1,258,291 blocks | 12 TiB | **4 × 1,258,291 = 5,033,164** |
+
+`store_partition_ranks` counts **writing ranks only**. The connector check
+(`_check_partition_ranks`) now requires it to equal `data_parallel_size`, one
+TP-0 worker per DP group, not `world_size`. Tests: **237 pass** (236, with the
+world-size test replaced by two writer-count tests).
+
+**Labels.**
+
+- `global` @ 71,104 is the **"43.4 GiB/GPU design point"**. It runs as
+  `store_partition = count`, which is behaviourally global (STEP 3a), so the
+  cross-rank share is available.
+- `per_rank` is 4 partitions of 17,776 PCM / 1,258,291 HBF blocks.
+- **The PHASE 9 headline is not replaced.** That decision is pending.
+
+**Runs.** Cap 48, both traces, 30 QPS, W = 5,000, charged timing:
+
+- (b) and (c): one unjittered run each.
+- (d): the unjittered run plus burst jitter j = 0.05 × gap (15.685 /
+  30.287 ms), seeds 1–3.
+
+That is 24 runs (`scripts/phase14/step3a_ctrl.sh`, table
+`step3a_ctrl_table.py`). The comparison arm "global @ 142,213" is the PHASE 9
+pool, using the same composition: `s0_b`, `s3a_def_c`, and `s0_d` +
+`p3_js{1,2,3}`.
+
+**Labels on the columns:**
+
+- **B/req are per TP shard** (one of 2).
+- **Batch is per active scheduler (TP group)**, i.e. `batch_mean_cluster / 4`.
+- `notdone = 0` and HBF evictions = 0 in all runs. Ranks seen = 4 in every
+  partition-mode run.
+
+### Conversation
+
+| config | arm | N | HBF B/req (per TP shard) | PCM B/req (per TP shard) | hit rate | reuse hit blk | cross-rank share | mean PCM residency s | batch / active sched | HBF evictions | ranks seen |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | global @ 142,213 (PHASE 9 pool) | 1 | 3,370,675,339 | 1,722,617,954 | 0.1643 | 670,585 | — | 113.34 | 46.336 | 0 | None |
+| (b) | global @ 71,104 — 43.4 GiB/GPU design point | 1 | 3,411,597,591 | 1,724,438,282 | 0.1648 | 672,601 | 74.49% | 56.80 | 46.323 | 0 | 4 |
+| (b) | per_rank 4 × 17,776 | 1 | 3,418,975,371 | 1,728,127,173 | 0.1648 | 672,505 | — | 56.42 | 46.435 | 0 | 4 |
+| (c) | global @ 142,213 (PHASE 9 pool) | 1 | 1,648,185,311 | 1,722,745,881 | 0.1645 | 671,266 | — | 81.22 | 46.154 | 0 | None |
+| (c) | global @ 71,104 — 43.4 GiB/GPU design point | 1 | 1,685,218,918 | 1,722,497,892 | 0.1633 | 666,233 | 75.43% | 40.85 | 46.268 | 0 | 4 |
+| (c) | per_rank 4 × 17,776 | 1 | 1,681,900,700 | 1,719,179,674 | 0.1645 | 671,202 | — | 40.67 | 46.007 | 0 | 4 |
+| (d) | global @ 142,213 (PHASE 9 pool) | 4 | 41,023,832 [39,653,474, 41,901,621] | 1,988,701,585 [1,987,125,969, 1,990,650,757] | 0.0968 [0.0948, 0.0977] | 395,108 [387,068, 398,652] | — | 42.11 [42.02, 42.16] | 44.926 [44.756, 45.159] | 0 | None |
+| (d) | global @ 71,104 — 43.4 GiB/GPU design point | 4 | 11,885,347 [10,942,939, 12,227,445] | 2,036,713,259 [2,034,385,814, 2,041,517,703] | 0.0927 [0.0894, 0.0946] | 378,100 [364,796, 386,140] | 75.57% [74.92%, 76.40%] | 20.44 [20.36, 20.48] | 45.073 [44.932, 45.349] | 0 | 4 |
+| (d) | per_rank 4 × 17,776 | 4 | 10,251,403 [9,677,308, 10,543,432] | 2,042,366,394 [2,042,045,137, 2,042,556,318] | 0.0929 [0.0924, 0.0939] | 379,044 [376,988, 383,356] | — | 20.11 [20.11, 20.11] | 45.013 [44.986, 45.083] | 0 | 4 |
+
+(b) Conversation: sharing (per_rank vs global@71k) HBF +0.22%, PCM +0.21%, hit -0.01%, batch +0.24% | capacity (global@71k vs global@142k) HBF +1.21%, PCM +0.11%, hit +0.30%, batch -0.03%
+(c) Conversation: sharing (per_rank vs global@71k) HBF -0.20%, PCM -0.19%, hit +0.75%, batch -0.57% | capacity (global@71k vs global@142k) HBF +2.25%, PCM -0.01%, hit -0.75%, batch +0.25%
+(d) Conversation: sharing (per_rank vs global@71k) HBF -13.75%, PCM +0.28%, hit +0.25%, batch -0.13% | capacity (global@71k vs global@142k) HBF -71.03%, PCM +2.41%, hit -4.30%, batch +0.33% | (d) HBF ranges: g142 39,653,474-41,901,621, g71 10,942,939-12,227,445, p71 9,677,308-10,543,432; sharing ranges overlap: NO; capacity ranges overlap: NO
+global @ 142,213 (PHASE 9 pool): (b)->(c) 51.10%; (b)->(d) 98.76–98.82% (b ÷ d ×80.4–×85.0); batch gap (d) vs (b) -3.04%, (c) vs (b) -0.39%
+global @ 71,104 — 43.4 GiB/GPU design point: (b)->(c) 50.60%; (b)->(d) 99.64–99.68% (b ÷ d ×279.0–×311.8); batch gap (d) vs (b) -2.70%, (c) vs (b) -0.12%
+per_rank 4 × 17,776: (b)->(c) 50.81%; (b)->(d) 99.69–99.72% (b ÷ d ×324.3–×353.3); batch gap (d) vs (b) -3.06%, (c) vs (b) -0.92%
+
+### Tool&Agent
+
+| config | arm | N | HBF B/req (per TP shard) | PCM B/req (per TP shard) | hit rate | reuse hit blk | cross-rank share | mean PCM residency s | batch / active sched | HBF evictions | ranks seen |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | global @ 142,213 (PHASE 9 pool) | 1 | 1,696,787,333 | 885,673,951 | 0.4037 | 1,174,042 | — | 113.02 | 45.770 | 0 | None |
+| (b) | global @ 71,104 — 43.4 GiB/GPU design point | 1 | 1,730,365,358 | 883,822,166 | 0.4037 | 1,174,071 | 74.23% | 56.97 | 46.090 | 0 | 4 |
+| (b) | per_rank 4 × 17,776 | 1 | 1,729,667,006 | 883,472,990 | 0.4036 | 1,173,911 | — | 56.35 | 45.967 | 0 | 4 |
+| (c) | global @ 142,213 (PHASE 9 pool) | 1 | 811,414,847 | 885,975,417 | 0.4040 | 1,174,945 | — | 80.80 | 45.286 | 0 | None |
+| (c) | global @ 71,104 — 43.4 GiB/GPU design point | 1 | 848,324,723 | 885,603,697 | 0.4039 | 1,174,785 | 72.94% | 40.97 | 45.718 | 0 | 4 |
+| (c) | per_rank 4 × 17,776 | 1 | 847,666,217 | 884,945,191 | 0.4040 | 1,175,105 | — | 40.37 | 45.701 | 0 | 4 |
+| (d) | global @ 142,213 (PHASE 9 pool) | 4 | 20,625,359 [17,168,859, 23,678,419] | 1,000,597,094 [998,507,020, 1,003,026,383] | 0.3668 [0.3650, 0.3677] | 1,066,919 [1,061,727, 1,069,567] | — | 42.84 [42.71, 42.93] | 44.775 [44.478, 44.913] | 0 | None |
+| (d) | global @ 71,104 — 43.4 GiB/GPU design point | 4 | 5,403,836 [4,854,383, 5,944,902] | 1,023,349,883 [1,022,163,419, 1,024,544,735] | 0.3665 [0.3663, 0.3666] | 1,065,887 [1,065,535, 1,066,239] | 74.73% [72.97%, 76.37%] | 20.66 [20.64, 20.69] | 45.036 [45.001, 45.088] | 0 | 4 |
+| (d) | per_rank 4 × 17,776 | 4 | 4,082,631 [4,082,631, 4,082,631] | 1,024,994,181 [1,024,847,249, 1,025,434,976] | 0.3670 [0.3669, 0.3671] | 1,067,447 [1,067,199, 1,067,647] | — | 20.37 [20.36, 20.39] | 44.894 [44.882, 44.911] | 0 | 4 |
+
+(b) Tool&Agent: sharing (per_rank vs global@71k) HBF -0.04%, PCM -0.04%, hit -0.01%, batch -0.27% | capacity (global@71k vs global@142k) HBF +1.98%, PCM -0.21%, hit +0.00%, batch +0.70%
+(c) Tool&Agent: sharing (per_rank vs global@71k) HBF -0.08%, PCM -0.07%, hit +0.03%, batch -0.04% | capacity (global@71k vs global@142k) HBF +4.55%, PCM -0.04%, hit -0.01%, batch +0.95%
+(d) Tool&Agent: sharing (per_rank vs global@71k) HBF -24.45%, PCM +0.16%, hit +0.15%, batch -0.31% | capacity (global@71k vs global@142k) HBF -73.80%, PCM +2.27%, hit -0.10%, batch +0.58% | (d) HBF ranges: g142 17,168,859-23,678,419, g71 4,854,383-5,944,902, p71 4,082,631-4,082,631; sharing ranges overlap: NO; capacity ranges overlap: NO
+global @ 142,213 (PHASE 9 pool): (b)->(c) 52.18%; (b)->(d) 98.60–98.99% (b ÷ d ×71.7–×98.8); batch gap (d) vs (b) -2.17%, (c) vs (b) -1.06%
+global @ 71,104 — 43.4 GiB/GPU design point: (b)->(c) 50.97%; (b)->(d) 99.66–99.72% (b ÷ d ×291.1–×356.5); batch gap (d) vs (b) -2.29%, (c) vs (b) -0.81%
+per_rank 4 × 17,776: (b)->(c) 50.99%; (b)->(d) 99.76–99.76% (b ÷ d ×423.7–×423.7); batch gap (d) vs (b) -2.33%, (c) vs (b) -0.58%
+
+### Reading, per the rule set before the runs
+
+The **sharing effect** is per_rank vs global @ 71,104. The **capacity effect**
+is global @ 71,104 vs global @ 142,213. For (d) HBF, a difference counts as an
+effect only if the ranges do not overlap. Single runs are readable for (b), (c)
+and all PCM / hit-rate values (spread < 1%).
+
+| | sharing: (b) HBF | sharing: (c) HBF | **sharing: (d) HBF** | capacity: (b) HBF | capacity: (c) HBF | **capacity: (d) HBF** |
+|---|---|---|---|---|---|---|
+| Conversation | +0.22% | −0.20% | **−13.75% (ranges do not overlap → effect)** | +1.21% | +2.25% | **−71.03% (ranges do not overlap → effect)** |
+| Tool&Agent | −0.04% | −0.08% | **−24.45% (ranges do not overlap → effect)** | +1.98% | +4.55% | **−73.80% (ranges do not overlap → effect)** |
+
+The (d) ranges behind those calls:
+
+| (d) HBF B/req range | global @ 142,213 | global @ 71,104 | per_rank |
+|---|---|---|---|
+| Conversation | 39.7–41.9 M | 10.9–12.2 M | 9.7–10.5 M |
+| Tool&Agent | 17.2–23.7 M | 4.85–5.94 M | 4.08 M (all four runs identical) |
+
+1. **The capacity effect is large for (d) and small for (b) and (c).** At the
+   43.4 GiB/GPU design point:
+   - mean PCM residency halves: (b) 113.3 → 56.8 s Conv, 113.0 → 57.0 s T&A;
+     (d) 42.1 → 20.4 s and 42.8 → 20.7 s;
+   - fewer blocks are read while resident, so `if_read` drops more and demotes
+     fewer;
+   - (d) HBF falls by ~71–74%, and (d) PCM B/req rises by 2.4% / 2.3%;
+   - (d) hit rate falls 4.30% on Conversation and 0.10% on Tool&Agent;
+   - (b) and (c) write 1.2–4.6% more to HBF.
+2. **The sharing effect is negligible for (b) and (c) (≤ 0.22%) but is an
+   effect for (d) by the rule:** −13.75% / −24.45%, a few million B/req in
+   absolute terms. Partitioning lowers (d)'s HBF writes further.
+   - Cross-rank evictions are **72.9–76.4%** of memory-tier evictions at
+     71,104, in every config, unchanged from 142,213.
+   - All four per_rank T&A (d) runs give **the same** HBF value, 4,082,631
+     B/req: the jitter seeds did not move it. This fits the discrete-outcome
+     candidate recorded earlier.
+3. **Reductions at each pool size** (single (b)/(c); (d) range over 4 runs):
+
+   | | (b) → (c) | (b) → (d) | b ÷ d |
+   |---|---|---|---|
+   | Conv, global @ 142,213 | 51.10% | 98.76–98.82% | ×80.4–×85.0 |
+   | Conv, **global @ 71,104 (design point)** | **50.60%** | **99.64–99.68%** | ×279.0–×311.8 |
+   | Conv, per_rank | 50.81% | 99.69–99.72% | ×324.3–×353.3 |
+   | T&A, global @ 142,213 | 52.18% | 98.60–98.99% | ×71.7–×98.8 |
+   | T&A, **global @ 71,104 (design point)** | **50.97%** | **99.66–99.72%** | ×291.1–×356.5 |
+   | T&A, per_rank | 50.99% | 99.76% | ×423.7 |
+
+**Batch:**
+
+- Per active scheduler: 44.9–46.4 in every arm.
+- **Gaps (d) vs (b)**, within each arm: −2.70% to −3.06% (Conv) and −2.17% to
+  −2.33% (T&A).
+- **Gaps (c) vs (b):** −0.12% to −1.06%.
+- **Across arms:** capacity −0.03% to +0.95%, sharing −0.57% to +0.24%.
+
+**Labelled as instructed: the 71,104 runs are the "43.4 GiB/GPU design point".
+They are a control here, and the PHASE 9 headline (142,213) is unchanged until
+decided.**
+
+## CORRECTION NOTE — audit of every place that divides by 8 workers or assumes 8 writers
+
+**Points back to** PHASE 5 (corrected), PHASE 8, PHASE 9, PHASE 10, PHASE 12
+and the earlier PHASE 14 steps. None of that text is edited. The cause, in all
+cases: **only the 4 TP-0 workers are scheduled and write to the store**
+(STEP 3a constraint).
+
+### Code (stock output, deliberately unchanged)
+
+| where | what | effect |
+|---|---|---|
+| `util/results.py:382-395` (`get_batch_stats`) | `batch_mean_per_scheduler`, `hbm_mean_used_blocks_per_rank`, `hbm_mean_occupancy_frac` divide by `len(workers)` = 8, which includes the 4 idle TP-1 workers. `batch_scheduler_count` = 8 | means are **½** the per-active-scheduler value. `batch_peak_*` and `hbm_peak_*` are maxima and are unaffected. `batch_mean_cluster` is correct; **per active scheduler = `batch_mean_cluster / 4`** |
+| `util/results.py:93,100` (`get_parallel_stats`) | `parallel_*_rank_count` = 8 | correct as a worker count, but only 4 run requests |
+| `mooncake/store.py` capacity, via `run_one.py` BASE `memory_capacity_blocks = 142213`, `ssd_capacity_blocks = 10066329` | sized for 8 writers | **2× the design capacity** relative to the TP-0 write stream |
+
+### findings.md, by kind
+
+1. **"43.4 GiB/GPU" attached to 142,213-block results means 86.8 GiB per
+   writing GPU.** This covers PHASE 5 corrected (~1944–2121), the PHASE 8
+   STEP 1 block table (~2769), PHASE 9 STEP 3 "at 43.4 GiB per GPU the PCM
+   tier is still too small…" (~3385, ~3633), PHASE 10 throughout (~3857–4069)
+   and the PHASE 12 Settings (~4529). The **design point** (43.4 GiB per
+   writing GPU) is 71,104 blocks, measured above.
+2. **PHASE 10 capacity sweep.**
+   - Its **GiB/GPU column is ×2** per writing GPU.
+   - The knee at "~822 GiB/GPU, 19× the budget" (~3949, ~4061) is
+     **~1,645 GiB per writing GPU, ~38× the design point**.
+   - The residency/TTFR crossing at "1.8–2.8×, 77–120 GiB/GPU" (~4001–4016) is
+     **3.6–5.6×, 154–240 GiB** per writing GPU.
+   - "43.4 GiB/GPU = 5.3% / 10.2% of footprint" (~3906, ~4062) refers to
+     142,213 blocks. **The design point, 71,104 blocks, is 2.6% / 5.1%** of the
+     footprint (2,695,220 / 1,397,479 blocks).
+   - Its "requests" columns share the error in item 3.
+3. **PHASE 9 STEP 4 "requests to wear out"** (~3641–3668), and the PHASE 10
+   "requests" columns, divide the **24 TiB × 3000 P/E** budget by **one TP
+   shard's** bytes per request. Only the TP-0 half of the HBF (12 TiB) receives
+   those bytes; the TP-1 half receives the mirror stream. **Every absolute
+   requests-to-wear-out figure is 2× too high. Ratios between columns (×2.05,
+   ×2.09, etc.) are unaffected.**
+4. **Absolute B/req are per TP shard.** That is every HBF, PCM and memory-tier
+   bytes/request, bytes/token and total write-byte figure in this file.
+   Physical per-cluster write bytes are 2× these. Reductions and ratios are
+   unaffected.
+5. **Batch and HBM-mean figures are ÷ 8 workers.** That is every "batch/sched",
+   "mean batch / scheduler", "achieved batch" and "mean HBM occupancy" in PHASE
+   9 STEPs 2–4, PHASE 11, 12 and 13, and PHASE 14 up to this point. Per active
+   scheduler (TP group) the value is **2×**; e.g. cap 48 (b) Conversation is
+   23.168 → **46.336**. PHASE 9 STEP 1 "8 schedulers, so cluster concurrency is
+   8 × `max_parallem_sum`" (~3117–3118, also ~3143, ~3206 "384 cluster-wide")
+   reads **4 schedulers, 4 × `max_parallem_sum`, 192 cluster-wide**. Batch
+   *gaps* between arms are unaffected.
+6. **PCM residency at 142,213** (PHASE 9 STEP 3, PHASE 10) is the residency of a
+   2×-design pool. At the design point it measures about half (above).
+
+### Also assumes 8 writers, not edited here
+
+`CLAUDE.md`, "Capacity bookkeeping" ("pool value = per-GPU design value × 8";
+"`memory_capacity_blocks = 142213` is THE correct configuration"). It is
+gitignored and is the project's instruction file, so it is flagged to the user
+rather than changed.
+
+## DECISION RECORD — headline configuration (after the STEP 3a controls)
+
+**These decisions were made on hardware grounds, not on the control-run
+results.** They are recorded as such, and they would stand even if the results
+had gone the other way.
+
+1. **Headline = design capacity + `per_rank`.**
+   - **Capacity.** 43.4 GiB/GPU is fixed by die area: 2 PCM dies per stack,
+     each the area of a 1 Tbit TLC die. The pool sized for the 4 writing
+     (TP-0) ranks is therefore the design point: **71,104 blocks, or 66,220
+     pending the unit check below.** The PHASE 9 pool of 142,213 blocks
+     becomes the **86.8 GiB/GPU point**, which corresponds to 4 PCM dies per
+     stack.
+   - **Partition.** PCM sits in-package on each GPU's own HBF stacks, so the
+     per-GPU pools are private. **`per_rank` is the faithful model;** `global`
+     is reported as a variant.
+   - **What it moves**, from the STEP 3a controls at 71,104:
+     - (c) goes slightly **down**: (b)→(c) 51.10% / 52.18% → 50.81% / 50.99%
+       under per_rank (50.60% / 50.97% global).
+     - (d) goes **up**: (b)→(d) 98.6–99.0% → 99.69–99.76% under per_rank.
+     - Both directions are stated here, so the decision cannot be read as
+       chosen for the (d) number.
+2. **The PHASE 9 STEP 3 cap-48 figures (142,213, global) are not deleted.**
+   From now on they are quoted as "the 86.8 GiB/GPU point, global pool".
+
+**No headline run has been made yet.** It waits on the unit check.
+
+## OPEN — unit check before any headline run
+
+The LaTeX turns 43.4 Gbit/stack into 5.43 GiB, i.e. it reads Gbit as **binary**
+(2^30 bit). `CLAUDE.md` adopted the same reading. If the 0.62 Gb/mm² source
+is **decimal** (10^9 bit), the design changes:
+
+| reading of "Gb" | per stack | per GPU | blocks per writing rank (÷ 2,621,440 B) | pool, 4 writing ranks (`per_rank` 4 × …) |
+|---|---|---|---|---|
+| binary (2^30 bit) | 5.425 GiB | **43.4 GiB** | 17,776.64 → **17,776** | **71,104** |
+| decimal (10^9 bit) | 5.425 GB = 5.052 GiB | **40.42 GiB** | 16,555.79 → **16,555** | **66,220** |
+
+**Both are recorded; neither is chosen.** No headline run until the user
+confirms.
+
+**The same question runs through the rest of the chain, and should be settled
+together:**
+
+- **The 35 mm² die is "the area of a 1 Tbit TLC die" at 29 Gb/mm².**
+  1 Tbit = 1024 Gbit gives 1024 / 29 = **35.31 mm²**, with 128 GiB per die (the
+  LaTeX l.215–216 figures). 1 Tbit = 1000 Gbit gives **34.48 mm²**. So the PCM
+  die area itself depends on the same unit reading.
+- **HBF capacity, 384 GB per stack.** Read as GiB (as `CLAUDE.md` does): 3 TiB
+  per GPU, **1,258,291** blocks per writing rank. Read as decimal GB:
+  3.072 TB = 2.794 TiB per GPU, **1,171,875** blocks per rank (pool 4,687,500).
+  HBF never evicts in any run so far, so this changes no measured number, but
+  it does change the endurance budget.
+- **TLC sets two things here:** PCM capacity, through die area, and HBF
+  endurance, through 3000 P/E. One sourcing exercise should cover both.
+
+## FLAG — under `if_read`, a smaller PCM gives FEWER HBF writes
+
+Under `if_read`, a block reaches HBF only if it was read while resident in
+PCM. A smaller pool shortens residency, so more blocks are dropped unread and
+fewer are demoted. Part of (d)'s gain at the design point can therefore be
+**lost reuse rather than better absorption**.
+
+**From now on, every (d) result reports two numbers next to the reduction:**
+
+- hit rate vs (b) at the same pool;
+- HBF bytes written per reuse-hit block, for (b), (c) and (d).
+
+Computed now for the STEP 3a control arms, with the 86.8 GiB/GPU point for
+reference. (d) is the range over 4 runs: unjittered + j = 0.05 seeds 1–3.
+
+#### Conversation
+
+| pool / partition | config | N | hit rate | hit rate vs (b), same pool | reuse hit blocks | HBF write bytes per reuse-hit block | HBF B/req |
+|---|---|---|---|---|---|---|---|
+| global @ 142,213 (86.8 GiB/GPU point) | (b) | 1 | 0.1643 | — | 670,585 | 25,132,350 | 3,370,675,339 |
+| global @ 142,213 (86.8 GiB/GPU point) | (c) | 1 | 0.1645 | +0.10% | 671,266 | 12,276,693 | 1,648,185,311 |
+| global @ 142,213 (86.8 GiB/GPU point) | (d) | 4 | 0.0948 – 0.0977 | -42.28% – -40.55% | 387,068 – 398,652 | 497,344 – 526,940 | 39,653,474 – 41,901,621 |
+| global @ 71,104 (design capacity, variant) | (b) | 1 | 0.1648 | — | 672,601 | 25,361,229 | 3,411,597,591 |
+| global @ 71,104 (design capacity, variant) | (c) | 1 | 0.1633 | -0.95% | 666,233 | 12,647,369 | 1,685,218,918 |
+| global @ 71,104 (design capacity, variant) | (d) | 4 | 0.0894 – 0.0946 | -45.76% – -42.59% | 364,796 – 386,140 | 149,987 – 161,460 | 10,942,939 – 12,227,445 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (b) | 1 | 0.1648 | — | 672,505 | 25,419,702 | 3,418,975,371 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (c) | 1 | 0.1645 | -0.19% | 671,202 | 12,529,020 | 1,681,900,700 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (d) | 4 | 0.0924 – 0.0939 | -43.94% – -43.00% | 376,988 – 383,356 | 126,218 – 139,494 | 9,677,308 – 10,543,432 |
+
+#### Tool&Agent
+
+| pool / partition | config | N | hit rate | hit rate vs (b), same pool | reuse hit blocks | HBF write bytes per reuse-hit block | HBF B/req |
+|---|---|---|---|---|---|---|---|
+| global @ 142,213 (86.8 GiB/GPU point) | (b) | 1 | 0.4037 | — | 1,174,042 | 7,226,263 | 1,696,787,333 |
+| global @ 142,213 (86.8 GiB/GPU point) | (c) | 1 | 0.4040 | +0.08% | 1,174,945 | 3,452,991 | 811,414,847 |
+| global @ 142,213 (86.8 GiB/GPU point) | (d) | 4 | 0.3650 – 0.3677 | -9.57% – -8.90% | 1,061,727 – 1,069,567 | 80,853 – 110,838 | 17,168,859 – 23,678,419 |
+| global @ 71,104 (design capacity, variant) | (b) | 1 | 0.4037 | — | 1,174,071 | 7,369,083 | 1,730,365,358 |
+| global @ 71,104 (design capacity, variant) | (c) | 1 | 0.4039 | +0.06% | 1,174,785 | 3,610,553 | 848,324,723 |
+| global @ 71,104 (design capacity, variant) | (d) | 4 | 0.3663 – 0.3666 | -9.24% – -9.18% | 1,065,535 – 1,066,239 | 22,779 – 27,878 | 4,854,383 – 5,944,902 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (b) | 1 | 0.4036 | — | 1,173,911 | 7,367,113 | 1,729,667,006 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (c) | 1 | 0.4040 | +0.10% | 1,175,105 | 3,606,768 | 847,666,217 |
+| per_rank 4 × 17,776 (design capacity, faithful) | (d) | 4 | 0.3669 – 0.3671 | -9.09% – -9.05% | 1,067,199 – 1,067,647 | 19,120 – 19,128 | 4,082,631 – 4,082,631 |
+
+**What the numbers say about lost reuse at the design point** (per_rank @ 71,104
+vs global @ 142,213):
+
+| | (d) hit rate vs (b), same pool | (d) reuse-hit blocks | (d) HBF bytes per reuse-hit block |
+|---|---|---|---|
+| **Conversation** | −40.55% to −42.28% → **−43.00% to −43.94%** | 387,068–398,652 → **376,988–383,356** (about −2.5%) | 497,344–526,940 → **126,218–139,494** |
+| **Tool&Agent** | −8.90% to −9.57% → **−9.05% to −9.09%** | 1,061,727–1,069,567 → **1,067,199–1,067,647** (inside the old range) | 80,853–110,838 → **19,120–19,128** |
+
+- **Conversation:** some reuse is lost at the design point. The hit-rate cost of
+  `if_read` widens by ~1.5–3 points and reuse-hit blocks fall ~2.5%. That is
+  small next to a ~4× fall in HBF bytes per reuse-hit block.
+- **Tool&Agent:** no reuse loss is detectable. Reuse-hit blocks at the design
+  point fall inside the 142,213 range.
+- So on these traces **most of (d)'s gain at the design point is not lost
+  reuse.** The mechanism the flag describes is real, and the per-reuse-hit
+  metric will show it wherever it dominates. This is recorded, not concluded,
+  because each arm has only 4 runs.
+- (b) and (c) are unaffected:
+  - (b) spends ~25.1–25.4 M (Conv) and ~7.2–7.4 M (T&A) HBF bytes per
+    reuse-hit block.
+  - (c) spends about half that at every pool.
+  - Their hit rates match (b)'s within 1%.
+
+## NOTE — CLAUDE.md updated
+
+The "Capacity bookkeeping" section of `CLAUDE.md` now states:
+
+- **pool = per-GPU capacity × number of WRITING ranks** (TP-0 only = DP size =
+  4);
+- design pool **71,104** (or 66,220, pending the unit check);
+- 142,213 = the 86.8 GiB/GPU point;
+- HBF pool 5,033,164 for the writing ranks;
+- `store_partition_ranks` = DP size.
+
+`CLAUDE.md` is gitignored, so the change is on disk only.
+
+## RESOLVED — unit check: binary throughout (user confirmation, 2026-10-11)
+
+**Points back to** "OPEN — unit check" above. **Resolved; the binary reading
+stands:**
+
+| quantity | reading | basis (as given by the user) | consequence |
+|---|---|---|---|
+| 0.62 Gb/mm² (PCM density) | **binary** | TechInsights lists the 1st-gen die as "128Gb (16GB)" | **headline pool 71,104 = `per_rank` 4 × 17,776 = 43.4 GiB/GPU** |
+| 1 Tbit TLC die | **binary** | → 1024 / 29 = 35.31 mm², 128 GiB | the design keeps **35 mm²**; that rounding costs **< 1% capacity** (35 / 35.31 = 0.991; 35.31 mm² would give 43.79 GiB/GPU) |
+| 384 GB per HBF stack | **binary** | H3 sizes HBF at ~16× its 192 GB HBM: 16 × 192 = 3,072 = 8 × 384 | **HBF stays 5,033,164 = 4 × 1,258,291** |
+| 29 Gb/mm² (TLC density) | **OPEN** | still uncited | its unit stays OPEN until sourced |
+
+The decimal alternative (66,220 / 16,555) is **not** used.
+
+## DECISION — PCM density: 1st-gen XPoint, 0.62 Gb/mm² is the headline density
+
+- **Citation:** Ehrmann *et al.*, *Applied Research* 2022, e202200024,
+  doi:10.1002/appl.202200024. It gives 0.62 Gb/mm² for 20 nm Optane, and takes
+  that value from TechInsights (its ref. [127]). The LaTeX's "derived from
+  published die parameters" now cites it, at the contribution item and at the
+  density line (`\cite{ehrmann2022}`). The bib entry carries a TODO for title
+  and full author list. Source details are as supplied by the user; they were
+  not independently re-checked here.
+- **LIMITATION, higher-density PCM.** 2nd-gen XPoint (4-deck) roughly doubles
+  density. That would put the tier near the existing **86.8 GiB/GPU point**
+  (PHASE 9, 142,213 blocks, global pool), which is reported as an
+  **approximate higher-density point**. No new runs are made for it. It is
+  approximate because that point used the global pool, not `per_rank`.
+- **WORDING RULE.** Do not call 0.62 Gb/mm² "conservative" overall. A smaller
+  pool **lowers** (c)'s reduction slightly (51.10 / 52.18% → ~50.8 / 51.0%) but
+  **raises** (d)'s HBF reduction (→ ~99.7–99.8%) (STEP 3a controls). Its
+  direction depends on the policy.
+
+## NOTE — cost metrics: lost reuse explains little of (d)'s gain at the design point
+
+**Recorded (user-confirmed reading of the decision-record metrics):**
+
+- On **Tool&Agent**, (d) shows no detectable reuse loss while its HBF writes
+  fall **−74%**: reuse-hit blocks are 1,067,199–1,067,647 at the design point,
+  against 1,061,727–1,069,567 at 142,213.
+- On **Conversation**, reuse loss is **~2.5%** while HBF writes fall **−71%**.
+
+**Candidate mechanism, not a finding.** With a larger pool, more blocks get
+exactly one read while in PCM. They pass the `if_read` gate and are written to
+HBF, but are never read from HBF again. A smaller pool drops them unread
+instead, saving the HBF write at no reuse cost.
+
+**Test: new counter `count_hbf_readback`** (default off; stock output
+byte-identical when off). For every block written to HBF, it records whether
+that block is read back from HBF before the run ends.
+
+- `hbf_readback_written_blocks`: successful offload writes. A re-write of the
+  same key starts a new instance.
+- `hbf_readback_read_blocks`: instances read from HBF at least once before the
+  next write of that key or the end of the run.
+- Reads served from the memory tier do not count.
+- Code: `mooncake/store.py` `_record_offload_write` / `_record_offload_read`,
+  merged into the result after `asdict()` (prefix `hbf_readback_`).
+- Tests: **242 pass** (237 + 5 in `tests/test_hbf_readback.py`).
+
+It runs on the headline set and on the 142,213 global stock configs (b), (c)
+and (d) at cap 48, so the two pools can be compared. Results follow in the
+headline-set entry.
+
+## HEADLINE SET — design capacity (43.4 GiB/GPU), per_rank, cap 48
+
+**Configuration.** This is the headline, decided on hardware grounds (see the
+DECISION RECORD):
+
+| setting | value |
+|---|---|
+| PCM | `memory_capacity_blocks = 71104`, `store_partition = per_rank`, `store_partition_ranks = 4` (4 × 17,776 = 43.4 GiB per writing GPU, binary) |
+| HBF | `ssd_capacity_blocks = 5033164` (4 × 1,258,291) |
+| other flags | `count_hbf_readback = true` |
+| load | cap 48, 30 QPS, W = 5,000, charged timing, stock values |
+| model | `LLaMa2-70B-GQA` (Nhead 64, KV heads 8, Nlayer 80, Dmodel 8192), **FP16**, 163,840 B/token at TP2, block 2,621,440 B, TP2/PP1/DP4 (4 writing TP-0 ranks; the TP-1 stream is a mirror and is not simulated) |
+| hardware | `H3-B200-KVONLY` (md5 `9b4cba823dd4158d9bd3efe16bf74491`, pre-compensated `Capacity`, 78,643 HBM blocks per rank) |
+| workload | Mooncake FAST'25 traces, **a stand-in for CAG** |
+| runs | (b), (c): single unjittered runs. (d): pooled set of **N = 16 per trace**: unjittered + burst-jitter seeds 1–5 at j = 0.005 / 0.05 / 0.45 × min inter-burst gap (Conv 1.569 / 15.685 / 141.168 ms; T&A 3.029 / 30.287 / 272.582 ms) |
+
+Driver: `scripts/phase14/headline.sh`. Table:
+`scripts/phase14/headline_table.py`. Mechanism check:
+`scripts/phase14/headline_readback.py`. The jitter j are methodology choices,
+not hardware numbers.
+
+**Column units:** B/req are **per TP shard**; batch is **per active scheduler
+(TP group)**. (d) reductions are against the single unjittered (b) run;
+burst jitter moved (b) HBF by ≤ 0.5% wherever it was measured.
+
+**Checks, all passed:**
+
+- `hl_id_{b,d}_*` (new code, flags at default) are byte-identical to
+  `ced3806`, all four.
+- `count_hbf_readback` changes no non-counter field: `rb142_*` against stock,
+  all six.
+- The headline (b), (c) and unjittered (d) runs reproduce the STEP 3a per_rank
+  controls (`c48p_*`) exactly in every non-counter field.
+- `notdone = 0`, HBF evictions = 0 and cross-rank evictions = 0 in all 36
+  headline runs.
+
+### Conversation
+
+**Headline — 71,104 blocks, per_rank 4 × 17,776, 43.4 GiB/GPU** ((d): N = 16)
+
+| config | N | HBF B/req | (b)→ reduction | PCM B/req | hit rate | hit rate vs (b) | reuse-hit blk | HBF bytes / reuse-hit blk | HBF-written blk | read back from HBF | read-back share | batch / active sched | batch gap vs (b) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 3,418,975,371 | — | 1,728,127,173 | 0.1648 | — | 672,505 | 25,419,702 | 6,521,178 | 254,446 | 3.90% | 46.435 | — |
+| (c) | 1 | 1,681,900,700 | 50.81% | 1,719,179,674 | 0.1645 | -0.19% | 671,202 | 12,529,020 | 3,207,971 | 261,390 | 8.15% | 46.007 | -0.92% |
+| (d) | 16 | 5,952,766 – 11,702,632 | 99.66% – 99.83% | 2,037,775,860 – 2,043,415,626 | 0.0892 – 0.0939 | -45.87% – -43.00% | 364,035 – 383,356 | 77,939 – 153,261 | 11,354 – 22,321 | 480 – 5,408 | 2.39% – 33.88% | 44.872 – 45.263 | -3.36% – -2.52% |
+
+(d) pooled: N = 16, HBF B/req 5,952,766 – 11,702,632, worst-case (b)→(d) reduction 99.66%, best 99.83%, b ÷ d ×292.2 – ×574.4; (b)→(c) 50.81%
+  j = 0.005 x gap: 10,543,432 – 10,543,432, spread 0.00%; values [10543432, 10543432, 10543432, 10543432, 10543432]
+  j = 0.05 x gap: 9,677,308 – 11,702,632, spread 19.21%; values [10543432, 10241442, 9677308, 11702632, 10543432]
+  j = 0.45 x gap: 5,952,766 – 8,368,685, spread 32.70%; values [7238320, 5952766, 7714374, 7664042, 8368685]
+  unjittered: 10,543,432
+
+**Comparison — 142,213 blocks, global, the 86.8 GiB/GPU point** (unjittered, single runs)
+
+| config | N | HBF B/req | (b)→ reduction | PCM B/req | hit rate | hit rate vs (b) | reuse-hit blk | HBF bytes / reuse-hit blk | HBF-written blk | read back from HBF | read-back share | batch / active sched | batch gap vs (b) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 3,370,675,339 | — | 1,722,617,954 | 0.1643 | — | 670,585 | 25,132,350 | 6,429,053 | 261,870 | 4.07% | 46.336 | — |
+| (c) | 1 | 1,648,185,311 | 51.10% | 1,722,745,881 | 0.1645 | +0.10% | 671,266 | 12,276,693 | 3,143,664 | 259,519 | 8.26% | 46.154 | -0.39% |
+| (d) | 1 | 41,901,621 | 98.76% | 1,987,125,969 | 0.0974 | -40.71% | 397,596 | 526,937 | 79,921 | 18,304 | 22.90% | 44.756 | -3.41% |
+
+### Tool&Agent
+
+**Headline — 71,104 blocks, per_rank 4 × 17,776, 43.4 GiB/GPU** ((d): N = 16)
+
+| config | N | HBF B/req | (b)→ reduction | PCM B/req | hit rate | hit rate vs (b) | reuse-hit blk | HBF bytes / reuse-hit blk | HBF-written blk | read back from HBF | read-back share | batch / active sched | batch gap vs (b) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 1,729,667,006 | — | 883,472,990 | 0.4036 | — | 1,173,911 | 7,367,113 | 3,299,078 | 98,332 | 2.98% | 45.967 | — |
+| (c) | 1 | 847,666,217 | 50.99% | 884,945,191 | 0.4040 | +0.10% | 1,175,105 | 3,606,768 | 1,616,795 | 109,826 | 6.79% | 45.701 | -0.58% |
+| (d) | 16 | 4,082,631 – 6,347,555 | 99.63% – 99.76% | 1,022,936,220 – 1,025,434,976 | 0.3663 – 0.3688 | -9.24% – -8.62% | 1,065,439 – 1,072,671 | 19,120 – 29,718 | 7,787 – 12,107 | 1,504 – 1,696 | 12.42% – 19.31% | 44.845 – 45.022 | -2.44% – -2.06% |
+
+(d) pooled: N = 16, HBF B/req 4,082,631 – 6,347,555, worst-case (b)→(d) reduction 99.63%, best 99.76%, b ÷ d ×272.5 – ×423.7; (b)→(c) 50.99%
+  j = 0.005 x gap: 4,082,631 – 4,082,631, spread 0.00%; values [4082631, 4082631, 4082631, 4082631, 4082631]
+  j = 0.05 x gap: 4,082,631 – 4,082,631, spread 0.00%; values [4082631, 4082631, 4082631, 4082631, 4082631]
+  j = 0.45 x gap: 4,854,383 – 6,347,555, spread 28.08%; values [5290590, 4904714, 6347555, 4854383, 5189927]
+  unjittered: 4,082,631
+
+**Comparison — 142,213 blocks, global, the 86.8 GiB/GPU point** (unjittered, single runs)
+
+| config | N | HBF B/req | (b)→ reduction | PCM B/req | hit rate | hit rate vs (b) | reuse-hit blk | HBF bytes / reuse-hit blk | HBF-written blk | read back from HBF | read-back share | batch / active sched | batch gap vs (b) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 1,696,787,333 | — | 885,673,951 | 0.4037 | — | 1,174,042 | 7,226,263 | 3,236,365 | 98,428 | 3.04% | 45.770 | — |
+| (c) | 1 | 811,414,847 | 52.18% | 885,975,417 | 0.4040 | +0.08% | 1,174,945 | 3,452,991 | 1,547,651 | 100,898 | 6.52% | 45.286 | -1.06% |
+| (d) | 1 | 17,168,859 | 98.99% | 1,001,932,194 | 0.3650 | -9.57% | 1,061,727 | 80,853 | 32,747 | 2,080 | 6.35% | 44.859 | -1.99% |
+
+### The headline, numbers only
+
+| | **(b) → (c)** | **(b) → (d), worst case (N = 16)** | (b) → (d), best | (d) HBF B/req range | b ÷ d (range only) |
+|---|---|---|---|---|---|
+| **Conversation** | **50.81%** | **99.66%** | 99.83% | 5,952,766 – 11,702,632 | ×292.2 – ×574.4 |
+| **Tool&Agent** | **50.99%** | **99.63%** | 99.76% | 4,082,631 – 6,347,555 | ×272.5 – ×423.7 |
+
+**Cost of (d), reported next to the reduction (standing rule):**
+
+| | (d) hit rate vs (b), same pool | HBF bytes per reuse-hit block: (b) / (c) / (d) | HBF read-back share: (b) / (c) / (d) |
+|---|---|---|---|
+| Conversation | **−43.00% to −45.87%** | 25,419,702 / 12,529,020 / 77,939–153,261 | 3.90% / 8.15% / 2.39–33.88% |
+| Tool&Agent | **−8.62% to −9.24%** | 7,367,113 / 3,606,768 / 19,120–29,718 | 2.98% / 6.79% / 12.42–19.31% |
+
+**Batch gaps vs (b):** (c) −0.92% / −0.58%; (d) −2.52% to −3.36% / −2.06% to
+−2.44%. PCM B/req, (d) vs (b): +17.9–18.2% (Conv) and +15.8–16.1% (T&A).
+
+**Spread of (d) by j:**
+
+| j | Conversation | Tool&Agent |
+|---|---|---|
+| 0.005 × gap | all 5 seeds equal the unjittered value (10,543,432) | all 5 seeds equal the unjittered value (4,082,631) |
+| 0.05 × gap | 19.21% | all 5 seeds equal the unjittered value |
+| 0.45 × gap | 32.70% | 28.08% |
+
+Under `per_rank` the stock outcome is far more stable to small arrival
+perturbations than under the 142,213 global pool (STEP 3, j = 0.005: 3.44% /
+33.26%).
+
+### Read-back: the candidate mechanism, tested
+
+Candidate (recorded above): with a larger pool, more blocks get one read in PCM,
+pass `if_read`, are written to HBF, and are never read from HBF again.
+
+| trace | pool | N | HBF-written blk | read back | never read back | read-back share |
+|---|---|---|---|---|---|---|
+| Conversation | 142,213 global (86.8 GiB/GPU) | 1 | 79,921 | 18,304 | 61,617 | 22.90% |
+| Conversation | 71,104 per_rank (design), unjittered | 1 | 20,110 | 480 | 19,630 | 2.39% |
+| Conversation | 71,104 per_rank (design), pooled | 16 | 11,354 – 22,321 | 480 – 5,408 | 9,114 – 21,393 | 2.39% – 33.88% |
+|| Conversation: drop in HBF-written blocks 142k→71k: 57,600 – 68,567; of which never-read-back: 69.8% – 79.8% (unjittered 70.2%) |
+| Tool&Agent | 142,213 global (86.8 GiB/GPU) | 1 | 32,747 | 2,080 | 30,667 | 6.35% |
+| Tool&Agent | 71,104 per_rank (design), unjittered | 1 | 7,787 | 1,504 | 6,283 | 19.31% |
+| Tool&Agent | 71,104 per_rank (design), pooled | 16 | 7,787 – 12,107 | 1,504 – 1,696 | 6,283 – 10,603 | 12.42% – 19.31% |
+|| Tool&Agent: drop in HBF-written blocks 142k→71k: 20,640 – 24,960; of which never-read-back: 97.2% – 98.4% (unjittered 97.7%) |
+
+- **Tool&Agent:** **97.2–98.4%** of the HBF writes (d) avoids at the design
+  pool were blocks that, at 142,213, were written to HBF and **never read back
+  before the run ended**. Read-back blocks barely change: 2,080 → 1,504–1,696.
+- **Conversation:** **69.8–79.8%** of the avoided writes were
+  never-read-back. The remainder are blocks that were read back from HBF at
+  142,213 (18,304 → 480–5,408). That matches the ~2.5% reuse loss and the
+  wider hit-rate cost on Conversation.
+- **The data are consistent with the candidate**, completely on Tool&Agent and
+  mostly on Conversation.
+- **Caveat, stated plainly:** the comparison is per_rank @ 71,104 against
+  global @ 142,213, so pool size and partitioning change together. That is
+  what was asked for: the existing PHASE 9 configs.
+- **Status:** the mechanism stays a candidate. One more point is consistent
+  with it but does not establish it.
+
+**(b) and (c) read back almost nothing from HBF:** 2.98–4.07% and 6.52–8.26% of
+HBF-written blocks, at both pools. Most of the flash write stream in the stock
+configurations is never read from flash during the run. This holds within the
+W = 5,000 window, which censors late reads.
+
+## Headline set — follow-ups (before STEP 3b)
+
+### Bibliography
+
+The Ehrmann *et al.* entry now uses the fields supplied by the user. They are
+rendered as `\bibitem{ehrmann2022pcm}`, because the paper uses a hand-written
+`thebibliography`, not BibTeX. The BibTeX entry is kept verbatim as a comment
+beside it. Both `\cite`s use `ehrmann2022pcm`. The "title / author TODO" is
+closed.
+
+### CAVEAT — the HBF read-back share is a lower bound
+
+`count_hbf_readback` counts only reads that happen **before the W = 5,000
+window ends**. A block written to HBF late in the run has little time left to
+be read, so the share is a **lower bound, biased against late writes.** The
+same applies to "never read back" below: it means "not read back within the
+window".
+
+**Observation, pending STEP 4 (full traces), not a finding:**
+
+- In-window, config (b) reads back **3.90% (Conv) / 2.98% (T&A)** of its
+  HBF-written blocks at the headline pool.
+- At 142,213 the figures are 4.07% / 3.04%.
+- (c): 8.15% / 6.79%.
+
+### De-confounded read-back test — capacity only
+
+The headline comparison (per_rank @ 71,104 vs global @ 142,213) changed pool
+size and partitioning together. Here the STEP 3a `c48g` controls (global @
+71,104, `store_partition = count`) were re-run with `count_hbf_readback` on:
+unjittered + j = 0.05 × gap seeds 1–3, both traces, 8 runs
+(`scripts/phase14/readback71g.sh`, `rb71g_*`). **Every non-counter field is
+identical to the `c48g` controls in all 8.** So global 142,213 vs global
+71,104 differs only in capacity.
+
+The 142,213 side has a single run (the unjittered `rb142_d`). Both 71,104 arms
+use the same 4-run composition (unjittered + j = 0.05 seeds 1–3).
+
+| trace | pool | N | HBF-written blk | read back | never read back | read-back share | never-read-back share of the drop vs 142,213 |
+|---|---|---|---|---|---|---|---|
+| Conversation | 142,213 global | 1 | 79,921 | 18,304 | 61,617 | 22.90% | — |
+| Conversation | 71,104 global (capacity only) | 4 | 20,872 – 23,322 | 928 – 4,800 | 18,394 – 19,944 | 4.45% – 20.59% | 70.6% – 76.2% |
+| Conversation | 71,104 per_rank (capacity + partition), same 4 runs | 4 | 18,458 – 20,110 | 480 – 2,432 | 16,026 – 19,630 | 2.39% – 13.18% | 70.2% – 74.2% |
+| Tool&Agent | 142,213 global | 1 | 32,747 | 2,080 | 30,667 | 6.35% | — |
+| Tool&Agent | 71,104 global (capacity only) | 4 | 9,259 – 11,339 | 1,696 | 7,563 – 9,643 | 14.96% – 18.32% | 98.2% – 98.4% |
+| Tool&Agent | 71,104 per_rank (capacity + partition), same 4 runs | 4 | 7,787 | 1,504 | 6,283 | 19.31% | 97.7% |
+
+**Both comparisons agree.** Of the HBF writes (d) avoids at 71,104 compared
+with 142,213, the share that was never read back is:
+
+| | capacity only (global vs global) | capacity + partition (per_rank vs global) |
+|---|---|---|
+| Tool&Agent | **98.2–98.4%** | 97.7% |
+| Conversation | **70.6–76.2%** | 70.2–74.2% |
+
+**Per the rule, the "candidate" label is lifted.** The finding is stated with
+its window caveat:
+
+> **Within the W = 5,000 window, most of (d)'s HBF-write reduction at the
+> smaller PCM pool consists of blocks that, at the larger pool, pass the
+> `if_read` gate and are written to HBF but are not read back from HBF before
+> the window ends.** This is ~98% on Tool&Agent and ~70–76% on Conversation.
+> The rest of the Conversation reduction is blocks that *were* read back at
+> 142,213, which matches its ~2.5% reuse loss.
+
+Because "not read back" is window-bounded (above), the share is an **upper
+bound** on "never read back at all". STEP 4 (full traces) will tighten it.
+
+### Future work (no code)
+
+A stricter demotion gate than "read once while in PCM" may cut the remaining
+HBF writes that are not read back. One example is requiring two reads, or a
+read within a recency window. **Not explored.**
+
+## STEP 3b — ROBUSTNESS CHECK: HBM evictions spill to PCM (NOT the headline)
+
+**The headline stays the headline set above** (design capacity, `per_rank`,
+prefill admission). This is a robustness check of the **PCM entry model** only.
+
+### The flag
+
+`hbm_evict_save_policy` gains **`spill_only`**. The values are now `prefill`
+(default, stock), `count`, `on_evict` and `spill_only`.
+
+**What `spill_only` does:**
+
+- The prefill/admission save is switched off:
+  `kv_transfer/connectors/mooncake_store.py`, `build_connector_meta` skips
+  every save plan.
+- A block enters the store **only** when HBM evicts it, through the PHASE 12
+  hook (`KVCacheManager.evict` ← `BlockAllocator.allocate`, `_on_hbm_evict`,
+  `store.put_with_timing`).
+- Everything below the store is unchanged. (c)/(d) keep `write_back` +
+  `always`/`if_read`. In (b) an evicted block is written through to HBF.
+
+**New counters**, gated on the policy not being `prefill`, prefix
+`hbm_evict_`, merged after `asdict()`:
+
+- **`residue_blocks` / `residue_absent_blocks`:** keyed blocks still in the
+  writing workers' GPU prefix cache at run end, and of those the ones absent
+  from the store. They are counted in `finalize_run_stats`, called from
+  `get_mooncake_stats` before aggregation.
+- **`first_spill_count` / `_p50_s` / `_p90_s`:** time from a key's first
+  registration in the GPU prefix cache to its first capacity eviction.
+  - Registration is its admission to HBM. A new
+    `KVCacheManager.register_observer` records it, inert at default.
+  - Wired through `LLMScheduler` → `attach_kv_cache_manager`, a no-op under
+    `prefill`.
+  - Percentiles are nearest-rank.
+- **Spill key present / absent:** the existing `hbm_evict_present_blocks` /
+  `hbm_evict_absent_blocks`.
+- **`count_hbf_readback`** on.
+
+**Byte identity:** `sp_id_{b,d}_*` (new code, defaults) against `ced3806` →
+no diff, all four. **Tests: 250 pass** (242 + 8 in `tests/test_spill_only.py`).
+
+### Runs
+
+Same configuration as the headline: 71,104 per_rank (4 × 17,776), HBF
+5,033,164, cap 48, both traces. (b) and (c) single runs; (d) the 16-run pooled
+set (unjittered + seeds 1–5 at j = 0.005 / 0.05 / 0.45 × gap). 36 runs plus 4
+identity runs (`scripts/phase14/step3b.sh`, table `step3b_table.py`).
+
+**Units:**
+
+- B/req are per TP shard; batch is per active scheduler.
+- Every Δ is against the headline run with the same config, jitter and seed.
+- **Residue-adjusted** = measured writes + resident keyed blocks absent from
+  the store, each counted once × 2,621,440 B, per request. Those are the blocks
+  the stock model wrote at admission and `spill_only` never did.
+- `notdone = 0` in all runs.
+
+### Conversation
+
+| config | N | HBF B/req raw | HBF B/req residue-adjusted | headline HBF B/req | Δ adjusted vs headline | PCM B/req raw | PCM adjusted | Δ adjusted vs headline | hit rate | Δ hit vs headline | reuse-hit blk | memory evictions | batch / active sched | batch gap vs headline |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 3,225,653,608 | 3,371,880,153 | 3,418,975,371 | -1.38% | 1,631,466,291 | 1,777,692,836 | +2.87% | 0.0860 | -47.81% | 350,983 | 3,040,671 | 46.253 | -0.39% |
+| (c) | 1 | 1,595,352,285 | 1,740,413,862 | 1,681,900,700 | +3.48% | 1,632,631,259 | 1,777,692,836 | +3.40% | 0.0881 | -46.43% | 359,593 | 3,042,893 | 46.047 | +0.09% |
+| (d) | 16 | 0 | 163,042,034 – 163,126,444 | 5,952,766 – 11,702,632 | +1293.45% – +2639.16% | 1,779,302,400 – 1,785,772,638 | 1,942,358,065 – 1,948,881,256 | -4.89% – -4.37% | 0.0891 – 0.0922 | -3.80% – +0.02% | 363,689 – 376,131 | 3,322,646 – 3,334,987 | 44.790 – 45.220 | -0.29% – +0.77% |
+
+| config | HBM spills (capacity evictions) | spill key already in store / absent | end-of-run HBM residue (keyed) | of which absent from store | residue share of would-be store admissions | admission→first spill p50 / p90 s | HBF read-back share |
+|---|---|---|---|---|---|---|---|
+| (b) | 3,418,610 | 306,835 / 3,111,775 | 311,292 | 278,905 | 8.23% | 206.3 / 240.1 | 0.00% |
+| (c) | 3,410,408 | 296,411 / 3,113,997 | 310,884 | 276,683 | 8.16% | 147.9 / 168.4 | 0.00% |
+| (d) | 3,393,750 – 3,406,091 | 0 / 3,393,750 – 3,406,091 | 310,978 – 311,139 | 310,978 – 311,139 | 8.37% – 8.39% | 82.8 – 83.1 / 96.0 – 99.3 | — |
+
+
+### Tool&Agent
+
+| config | N | HBF B/req raw | HBF B/req residue-adjusted | headline HBF B/req | Δ adjusted vs headline | PCM B/req raw | PCM adjusted | Δ adjusted vs headline | hit rate | Δ hit vs headline | reuse-hit blk | memory evictions | batch / active sched | batch gap vs headline |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 1,471,123,816 | 1,622,209,987 | 1,729,667,006 | -6.21% | 754,201,395 | 905,287,565 | +2.47% | 0.3655 | -9.45% | 1,063,007 | 1,367,421 | 45.611 | -0.77% |
+| (c) | 1 | 716,370,346 | 868,008,591 | 847,666,217 | +2.40% | 753,649,320 | 905,287,565 | +2.30% | 0.3671 | -9.14% | 1,067,711 | 1,366,368 | 45.250 | -0.99% |
+| (d) | 16 | 369,099 | 162,856,960 – 163,140,600 | 4,082,631 – 6,347,555 | +2469.15% – +3895.97% | 801,347,469 – 808,345,141 | 964,071,784 – 970,833,002 | -5.98% – -5.14% | 0.3628 – 0.3674 | -1.17% – +0.10% | 1,055,199 – 1,068,703 | 1,457,345 – 1,470,692 | 44.258 – 44.661 | -1.45% – -0.79% |
+
+| config | HBM spills (capacity evictions) | spill key already in store / absent | end-of-run HBM residue (keyed) | of which absent from store | residue share of would-be store admissions | admission→first spill p50 / p90 s | HBF read-back share |
+|---|---|---|---|---|---|---|---|
+| (b) | 1,534,559 | 96,034 / 1,438,525 | 310,982 | 288,174 | 16.69% | 208.6 / 237.0 | 0.00% |
+| (c) | 1,529,826 | 92,354 / 1,437,472 | 311,011 | 289,227 | 16.75% | 149.0 / 171.0 | 0.00% |
+| (d) | 1,528,769 – 1,542,276 | 320 – 480 / 1,528,449 – 1,541,796 | 311,047 – 311,166 | 309,921 – 310,462 | 16.74% – 16.88% | 84.5 – 85.2 / 97.1 – 99.1 | 0.00% |
+
+
+**Further numbers:**
+
+| | Conversation | Tool&Agent |
+|---|---|---|
+| (b)→(c), raw / residue-adjusted | 50.54% / 48.38% (headline 50.81%) | 51.30% / 46.49% (headline 50.99%) |
+| (b)→(d), raw | 100.00% ((d) wrote **0** bytes to HBF in all 16 runs) | 99.97% ((d) 369,099 B/req) |
+| (d) hit rate vs (b), same model | +3.62% to +7.17% | −0.73% to +0.54% |
+| HBF bytes per reuse-hit block, (b) / (c) / (d) | 45,951,707 / 22,182,749 / 0 | 6,919,634 / 3,354,702 / 1,727–1,749 |
+| end-of-run residue absent from store, as % of headline (b)'s HBF blocks | 4.28% (278,905 / 6,521,178) | 8.73% (288,174 / 3,299,078) |
+| batch gap vs headline | −0.39% to +0.77% | −1.45% to −0.77% |
+
+The residue sits at the upper bound the rule anticipated: 310,884–311,292
+keyed blocks against 4 × 78,643 = 314,572. HBM is essentially full of keyed
+blocks at the end of the run.
+
+### Rules, as corrected before the runs
+
+| rule | Conversation | Tool&Agent |
+|---|---|---|
+| (i) (b)→(d) reduction within 5 points of the headline range | PASS (100.00% vs 99.66–99.83%) | PASS (99.97% vs 99.63–99.76%) |
+| (ii) **residue-adjusted** (b) HBF, (c) HBF and all PCM B/req, each within 5% of headline | **PASS** (largest \|Δ\| 4.89%: (d) PCM) | **FAIL** ((b) HBF −6.21%; (d) PCM −5.14% to −5.98%) |
+| (iii) (d) HBF B/req, **raw**, inside the per-trace band | **FAIL** (0 of 16 inside 5.65–12.29 M: every run is **0**) | **FAIL** (0 of 16 inside 3.88–6.67 M: every run is ~0.37 M) |
+
+On (iii): the residue share next to it is 8.37–8.39% (Conv) and 16.74–16.88%
+(T&A) of would-be store admissions. It biases (d) HBF **downward**. It cannot
+explain a drop to zero, though.
+
+**Verdict: the headline does NOT hold under spill. The result depends on the
+PCM entry model.** Both models are reported side by side (headline set and
+this section).
+
+### Why — measured, and it is a lookup interaction rather than a write effect
+
+| | store lookups that hit (of 5,000) | memory-tier read blocks | HBF read blocks | store-served ("disk") hit tokens |
+|---|---|---|---|---|
+| headline (b), Conv / T&A | 4,996 / 4,978 | 0 / 0 | 325,838 / 117,719 | 5,213,408 / 1,883,504 |
+| headline (d), Conv / T&A | 4,996 / 4,979 | 0 / 0 | 480 / 3,008 | 7,680 / 48,128 |
+| **spill_only (b), Conv / T&A** | **0 / 769** | 0 / 0 | **0 / 64** | **0 / 1,024** |
+| **spill_only (d), Conv / T&A** | **0 / 769** | 0 / 0 | **0 / 0** | **0 / 0** |
+
+**Under `spill_only` the store serves essentially no reads.** The connector
+queries the store from block 0 of the prompt (`get_num_new_matched_tokens`,
+`mooncake_store.py:89`). `MooncakeStore.lookup` stops at the first absent key
+(`store.py:104-107`). The prompt head, the shared system prompt, is hot in HBM.
+It is never evicted, so it is never spilled, so it is never in the store. Every
+lookup therefore misses at position 0, and the spilled tail behind it is
+unreachable.
+
+The knock-on effects:
+
+- (b)'s hit rate falls to its GPU-only part (0.0860 vs 0.1648 on Conv). Its
+  HBF read-back is 0.
+- (d)'s `if_read` gate never passes, because nothing in PCM is ever read. So
+  (d) drops every PCM victim and writes ~nothing to HBF.
+
+**What this robustness check therefore tests:** a PCM entry model in which PCM
+and HBF serve no reuse at all on Conversation and almost none on Tool&Agent. In
+that model (d)'s HBF stream is trivially ~0, and rule (iii) fails *below* the
+band. The headline's (d) figure is **not** contradicted by a design where
+spilled blocks are reused. That design was not reached, because of lookup
+semantics.
+
+**Not built, flagged for decision:** a lookup that starts at the end of the
+local GPU hit, i.e. queries `keys[num_computed_blocks:]` and does not require
+the HBM-resident head in the store. That would let spilled tails be found.
+Whether a real Mooncake/vLLM connector behaves that way, or like this one, is
+not settled here.
+
+**Admission → first spill**, p50 / p90:
+
+| config | Conversation | Tool&Agent |
+|---|---|---|
+| (b) | 206.3 / 240.1 s | 208.6 / 237.0 s |
+| (c) | 147.9 / 168.4 s | 149.0 / 171.0 s |
+| (d) | 82.8–83.1 / 96.0–99.3 s | 84.5–85.2 / 97.1–99.1 s |
+
+Faster configs run shorter and churn HBM sooner.
+
+**Spill keys already in the store:**
+
+- (b): 306,835 of 3,418,610 (Conv) and 96,034 of 1,534,559 (T&A). These are
+  re-spills of a key whose earlier copy is still stored.
+- (d): 0 (Conv) and 320–480 (T&A), because `if_read` drops unread victims from
+  the store entirely.
+
+### STEP 3b — result as recorded after review
+
+**Spill with prefix-from-zero store lookup: the store serves almost no reuse
+(lookup hits 0 / 769 of 5,000), so (d)'s gate never opens. Copy-at-admission
+is required for the store to be useful under this lookup.** This is **not** a
+test of a working spill hierarchy. The verdict and rules above stand as
+measured, under that label.
+
+## store_lookup_start — the vLLM-style lookup, and two run sets
+
+### The flag
+
+**`store_lookup_start`**:
+
+- **`zero`** (default, stock): the store lookup walks the prompt's keys from
+  block 0 and stops at the first miss.
+- **`after_hbm`**: the lookup begins at the first block **not already hit in
+  HBM** (`num_computed_tokens`), using that block's key, and stops at the
+  first store miss after it.
+  - Code: `mooncake/config.py`; `_lookup_after_hbm` in
+    `kv_transfer/connectors/mooncake_store.py`.
+  - The aligned full-prompt cap is applied on the absolute span.
+  - When the HBM hit already covers every full prompt block, no lookup is
+    made and no hit or miss is counted.
+
+**Justification.** vLLM's
+`KVConnectorBase_V1.get_num_new_matched_tokens(request, num_computed_tokens)`
+asks the external store for tokens **beyond** the locally computed ones. **We
+cite the interface only. We make no claim about how LMCache or Mooncake
+implement it internally.**
+
+**Checks:**
+
+- Tests: **255 pass** (250 + 5 in `tests/test_store_lookup_start.py`). They
+  show that `after_hbm` reaches a stored tail behind an HBM-only head (where
+  `zero` returns 0), and returns the same span as `zero` for a fully stored
+  prefix, including the full-prompt cap.
+- Byte identity at default: `la_id_{b,d}_*` against `ced3806`, no diff in all
+  four.
+
+**Runs:** 71,104 per_rank, HBF 5,033,164, cap 48, both traces,
+`count_hbf_readback` on (`scripts/phase14/lookup_after_hbm.sh`). B/req per TP
+shard; batch per active scheduler. Every Δ is against the headline run with
+the same config, jitter and seed.
+
+### Set A — headline sensitivity: copy-at-admission + `after_hbm`
+
+(b) and (c) single runs; (d) unjittered + j = 0.05 × gap seeds 1–3
+(`scripts/phase14/setA_table.py`).
+
+**Rule:** the headline holds under the vLLM-style lookup if (b) HBF, (c) HBF
+and all PCM B/req are within 5% of the headline **and** every (d) run lies in
+the per-trace band (Conv 5.65–12.29 M, T&A 3.88–6.67 M).
+
+### Conversation
+
+| config | N | store lookups hit / lookups | headline | store-served tokens | headline | reuse-hit blk | headline | HBF B/req | Δ vs headline | PCM B/req | Δ vs headline | hit rate | Δ | batch / active sched | Δ |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 447 / 4,990 | 4,996 / 5,000 | 5,213,408 | 5,213,408 | 672,505 | 672,505 | 3,418,975,371 | +0.00% | 1,728,127,173 | +0.00% | 0.1648 | +0.00% | 46.435 | +0.00% |
+| (c) | 1 | 439 / 4,989 | 4,996 / 5,000 | 5,262,416 | 5,262,416 | 671,202 | 671,202 | 1,681,900,700 | +0.00% | 1,719,179,674 | +0.00% | 0.1645 | +0.00% | 46.007 | +0.00% |
+| (d) | 4 | 0 / 4,991 – 4,992 | 4,996 / 5,000 | 0 | 7,680 – 62,976 | 370,588 – 378,268 | 376,988 – 383,356 | 0 | -100.00% | 2,047,655,018 – 2,048,890,241 | +0.27% – +0.31% | 0.0908 – 0.0927 | -3.33% – +0.34% | 44.895 – 45.185 | -0.42% – +0.44% |
+
+(b)->(c) 50.81%; (b)->(d) 100.00–100.00%; (d) hit vs (b) -44.89% – -43.75%; HBF bytes per reuse-hit block (b) 25,419,702 / (c) 12,529,020 / (d) 0; read-back share (b) 4.09% / (c) 8.51% / (d) — (nothing written to HBF)
+
+### Tool&Agent
+
+| config | N | store lookups hit / lookups | headline | store-served tokens | headline | reuse-hit blk | headline | HBF B/req | Δ vs headline | PCM B/req | Δ vs headline | hit rate | Δ | batch / active sched | Δ |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 158 / 4,997 | 4,978 / 5,000 | 1,883,504 | 1,883,504 | 1,173,911 | 1,173,911 | 1,729,667,006 | +0.00% | 883,472,990 | +0.00% | 0.4036 | +0.00% | 45.967 | +0.00% |
+| (c) | 1 | 158 / 4,993 | 4,979 / 5,000 | 1,934,752 | 1,934,752 | 1,175,105 | 1,175,105 | 847,666,217 | +0.00% | 884,945,191 | +0.00% | 0.4040 | +0.00% | 45.701 | +0.00% |
+| (d) | 4 | 0 / 4,994 | 4,979 / 5,000 | 0 | 48,128 | 1,058,847 – 1,059,871 | 1,067,199 – 1,067,647 | 0 | -100.00% | 1,054,897,340 – 1,056,187,613 | +2.89% – +3.06% | 0.3640 – 0.3644 | -0.82% – -0.70% | 44.581 – 44.687 | -0.67% – -0.49% |
+
+(b)->(c) 50.99%; (b)->(d) 100.00–100.00%; (d) hit vs (b) -9.80% – -9.71%; HBF bytes per reuse-hit block (b) 7,367,113 / (c) 3,606,768 / (d) 0; read-back share (b) 3.11% / (c) 7.07% / (d) — (nothing written to HBF)
+
+| rule | Conversation | Tool&Agent |
+|---|---|---|
+| A1: (b), (c) HBF and all PCM within 5% | PASS (largest \|Δ\| 0.31%) | PASS (largest \|Δ\| 3.06%) |
+| A2: every (d) run in band | **FAIL** (0 / 4: every (d) run writes **0** to HBF) | **FAIL** (0 / 4: **0**) |
+
+**Set A fails.** It fails *below* the band: under the vLLM-style lookup, (d)
+writes **nothing** to HBF.
+
+- (b) and (c) are **identical** to the headline in every write, hit and reuse
+  figure, including store-served tokens (5,213,408 / 1,883,504 for (b)).
+  Their lookup *hit counts* fall from 4,996 to 447 (Conv) because the from-zero
+  lookups counted HBM-resident heads as store hits while serving no tokens
+  from them.
+- **(d) store lookups hit 0 times** in every run. (d)'s hit-rate cost vs (b)
+  is −43.75% to −44.89% (Conv) and −9.71% to −9.80% (T&A).
+
+## CORRECTION NOTE — what opened (d)'s `if_read` gate in every copy-at-admission result
+
+**Points back to** every config-(d) result in PHASES 4–14 that used the stock
+lookup and copy-at-admission: PHASE 9, 10, 13, and the PHASE 14 headline,
+pooled bound, sweep and read-back test. None of that text is edited.
+
+**Measured:**
+
+1. **Across all 332 copy-at-admission runs on disk, PCM (the memory tier)
+   never served a single store hit:** `mooncake_memory_hit_tokens = 0` in
+   every one. Every store-served token came from HBF. At this capacity, under
+   copy-at-admission, PCM holds blocks that are still in HBM, and they have
+   left PCM before HBM evicts them.
+2. **In the headline and PHASE 9 (d) runs, `mooncake_memory_read_blocks = 0`,
+   yet 7,787–79,921 blocks per run passed the `if_read` gate and were
+   demoted**: `hl_d` 20,110 / 7,787, `s0_d` and `rb142_d` 79,921 / 32,747.
+   Their `read_count > 0` came from `MooncakeStore.lookup` incrementing
+   `read_count` on **every** hit key (`store.py:125`). Under the from-zero
+   lookup that includes HBM-resident head blocks, whose tokens are served
+   locally and never fetched from the store.
+3. **So the residual (d) HBF writes in every copy-at-admission result are
+   artefacts of lookup accounting, not of reuse.** With the vLLM-style lookup,
+   which looks up only beyond the HBM hit, they vanish (set A: 0). The
+   PHASE 14 read-back mechanism ("blocks pass `if_read` at the larger pool but
+   are not read back") stands as measured. It is re-labelled: the "pass" was a
+   lookup touch, not a read.
+4. **Constraint, same family.** Under the stock lookup, the load plan reads
+   `load_info["keys"][:blocks]` (`mooncake_store.py:543`). Those are the first
+   `blocks` keys counted from position 0, i.e. the head, not the external span
+   that was missing. That is why 64 of the 332 runs show
+   `memory_read_blocks > 0` with `memory_hit_tokens = 0`. Under `after_hbm`
+   the keys are the external span. Byte and block totals are unaffected; which
+   blocks get "read" is not.
+
+**What this means for the headline claim.** Under copy-at-admission, (d) at the
+design point is, to within lookup-accounting artefacts, **"drop every PCM
+victim, write ~nothing to flash, give up all store reuse"**. The reduction is
+real, but its price is the full hit-rate cost (−44% / −10% vs (b)), not a
+selective one.
+
+## Set B — STEP 3b rerun: spill_only + `after_hbm`
+
+Same runs and counters as STEP 3b (16-run (d) set). Table:
+`step3b_table.py tmp/phase14 lb`.
+
+**Store lookup hits first:**
+
+### Conversation
+
+| config | store lookups that hit / lookups | headline: hit / lookups | HBF read blocks | headline HBF read blocks |
+|---|---|---|---|---|
+| (b) | 436 / 4,990 | 4,996 / 5,000 | 300,788 | 325,838 |
+| (c) | 428 / 4,989 | 4,996 / 5,000 | 298,194 | 328,901 |
+| (d) | 52 – 76 / 4,988 – 4,991 | 4,996 / 5,000 | 16,633 – 24,256 | 480 – 8,448 |
+
+| config | N | HBF B/req raw | HBF B/req residue-adjusted | headline HBF B/req | Δ adjusted vs headline | PCM B/req raw | PCM adjusted | Δ adjusted vs headline | hit rate | Δ hit vs headline | reuse-hit blk | memory evictions | batch / active sched | batch gap vs headline |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 3,224,847,254 | 3,371,476,976 | 3,418,975,371 | -1.39% | 1,631,063,114 | 1,777,692,836 | +2.87% | 0.1646 | -0.14% | 671,530 | 3,039,902 | 46.327 | -0.23% |
+| (c) | 1 | 1,595,182,416 | 1,740,413,862 | 1,681,900,700 | +3.48% | 1,632,461,390 | 1,777,692,836 | +3.40% | 0.1645 | +0.02% | 671,306 | 3,042,569 | 46.138 | +0.29% |
+| (d) | 16 | 18,806,735 – 24,434,967 | 178,556,764 – 185,453,249 | 5,952,766 – 11,702,632 | +1465.26% – +2899.56% | 1,754,074,710 – 1,760,026,427 | 1,915,867,890 – 1,919,776,457 | -6.24% – -5.84% | 0.1023 – 0.1041 | +9.30% – +15.10% | 417,410 – 424,657 | 3,274,528 – 3,285,880 | 44.792 – 45.277 | -0.49% – +0.90% |
+
+| config | HBM spills (capacity evictions) | spill key already in store / absent | end-of-run HBM residue (keyed) | of which absent from store | residue share of would-be store admissions | admission→first spill p50 / p90 s | HBF read-back share |
+|---|---|---|---|---|---|---|---|
+| (b) | 3,418,577 | 307,571 / 3,111,006 | 311,325 | 279,674 | 8.25% | 203.9 / 238.2 | 3.89% |
+| (c) | 3,406,413 | 292,740 / 3,113,673 | 310,879 | 277,007 | 8.17% | 145.8 / 166.3 | 8.10% |
+| (d) | 3,395,521 – 3,407,981 | 38,537 – 56,369 / 3,345,632 – 3,356,984 | 310,969 – 311,163 | 304,699 – 309,552 | 8.32% – 8.46% | 82.9 – 83.3 / 96.0 – 99.3 | 31.43% – 45.48% |
+
+
+### Tool&Agent
+
+| config | store lookups that hit / lookups | headline: hit / lookups | HBF read blocks | headline HBF read blocks |
+|---|---|---|---|---|
+| (b) | 150 / 4,993 | 4,978 / 5,000 | 89,576 | 117,719 |
+| (c) | 152 / 4,993 | 4,979 / 5,000 | 92,024 | 120,922 |
+| (d) | 23 – 30 / 4,993 | 4,979 / 5,000 | 2,952 – 13,799 | 1,504 – 3,200 |
+
+| config | N | HBF B/req raw | HBF B/req residue-adjusted | headline HBF B/req | Δ adjusted vs headline | PCM B/req raw | PCM adjusted | Δ adjusted vs headline | hit rate | Δ hit vs headline | reuse-hit blk | memory evictions | batch / active sched | batch gap vs headline |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 1,471,166,808 | 1,622,231,482 | 1,729,667,006 | -6.21% | 754,222,891 | 905,287,565 | +2.47% | 0.4013 | -0.56% | 1,167,294 | 1,367,462 | 45.775 | -0.42% |
+| (c) | 1 | 716,365,103 | 868,008,591 | 847,666,217 | +2.40% | 753,644,077 | 905,287,565 | +2.30% | 0.4028 | -0.30% | 1,171,556 | 1,366,358 | 45.466 | -0.51% |
+| (d) | 16 | 5,340,922 – 15,306,588 | 167,089,013 – 177,615,667 | 4,082,631 – 6,347,555 | +2675.01% – +4081.42% | 791,801,758 – 796,957,082 | 953,871,237 – 959,508,382 | -6.98% – -6.33% | 0.3704 – 0.3741 | +0.42% – +1.94% | 1,077,215 – 1,087,967 | 1,439,138 – 1,448,971 | 44.208 – 44.631 | -1.54% – -0.87% |
+
+| config | HBM spills (capacity evictions) | spill key already in store / absent | end-of-run HBM residue (keyed) | of which absent from store | residue share of would-be store admissions | admission→first spill p50 / p90 s | HBF read-back share |
+|---|---|---|---|---|---|---|---|
+| (b) | 1,534,312 | 95,746 / 1,438,566 | 310,941 | 288,133 | 16.69% | 206.6 / 233.3 | 2.99% |
+| (c) | 1,531,000 | 93,538 / 1,437,462 | 310,989 | 289,237 | 16.75% | 146.9 / 165.4 | 6.12% |
+| (d) | 1,529,825 – 1,542,553 | 10,531 – 30,667 / 1,510,242 – 1,520,075 | 311,000 – 311,213 | 306,360 – 310,042 | 16.80% – 17.00% | 84.6 – 85.2 / 97.1 – 99.3 | 10.50% – 47.79% |
+
+
+**Tier of the store-served tokens** (unjittered runs):
+
+| | memory-tier (PCM) hit tokens | HBF hit tokens | PCM read blocks | HBF read blocks | demoted |
+|---|---|---|---|---|---|
+| Conv (b) | **590,976** | 4,765,520 | 33,993 | 300,788 | 3,039,902 |
+| Conv (c) | **424,064** | 4,722,992 | 23,497 | 298,194 | 3,042,569 |
+| Conv (d) | **635,568** | 204,544 | 34,665 | 17,842 | 39,851 |
+| T&A (b) | **346,576** | 1,395,616 | 19,311 | 89,576 | 1,367,462 |
+| T&A (c) | **331,824** | 1,427,360 | 17,925 | 92,024 | 1,366,358 |
+| T&A (d) | **298,912** | 41,472 | 14,764 | 6,510 | 18,266 |
+
+**This is a working spill hierarchy.**
+
+- PCM serves real reads: it now holds blocks HBM has just evicted, a victim
+  cache.
+- (b) and (c) keep the headline hit rate: −0.14% / +0.02% (Conv), −0.56% /
+  −0.30% (T&A).
+- (d)'s gate is opened by genuine PCM reads.
+
+**Further numbers:**
+
+| | Conversation | Tool&Agent |
+|---|---|---|
+| (b)→(c), raw / residue-adjusted | 50.53% / 48.38% | 51.31% / 46.49% |
+| (b)→(d), raw (16 runs) | **99.24–99.42%** | **98.96–99.64%** |
+| (d) HBF B/req, raw | **18,806,735 – 24,434,967** | **5,340,922 – 15,306,588** |
+| (d) hit rate vs (b), same model | −36.76% to −37.84% | −6.80% to −7.72% |
+| (d) hit rate vs headline (d) | **+9.30% to +15.10%** | +0.42% to +1.94% |
+| HBF bytes per reuse-hit block, (b) / (c) / (d) | 24.0 M / 11.9 M / 225–292 k | 6.30 M / 3.06 M / 25–70 k |
+| HBF read-back share, (b) / (c) / (d) | 3.89% / 8.10% / 31.4–45.5% | 2.99% / 6.12% / 10.5–47.8% |
+| end-of-run residue absent from store | 279,674 (b) | 288,133 (b) |
+| batch gap vs headline | −0.49% to +0.90% | −1.54% to −0.42% |
+
+**Rules (as for STEP 3b):**
+
+| rule | Conversation | Tool&Agent |
+|---|---|---|
+| (i) (b)→(d) within 5 points of the headline range | PASS (99.24–99.42% vs 99.66–99.83%) | PASS (98.96–99.64% vs 99.63–99.76%) |
+| (ii) residue-adjusted (b), (c) HBF and all PCM within 5% | **FAIL** ((d) PCM −5.84% to −6.24%; (b) −1.39%, (c) +3.48%) | **FAIL** ((b) HBF −6.21%; (d) PCM −6.33% to −6.98%) |
+| (iii) (d) HBF raw in the per-trace band | **FAIL** (0 / 16, all **above**: 18.8–24.4 M vs 5.65–12.29 M) | **FAIL** (1 / 16; most above: 5.34–15.31 M vs 3.88–6.67 M) |
+
+On (iii), the residue share next to it is 8.32–8.46% (Conv) and 16.80–17.00%
+(T&A) of would-be store admissions. It biases (d) HBF downward, so (d)'s true
+spill-model HBF stream is, if anything, larger than shown.
+
+**Verdict: the headline numbers do not carry over to a working spill
+hierarchy; the result depends on the PCM entry model.**
+
+- Under spill + vLLM-style lookup, (d) writes **1.6–4.1× (Conv) and
+  0.8–3.8× (T&A)** the headline's HBF bytes. The (b)→(d) reduction is still
+  **≥ 98.96%**.
+- In exchange, (d) recovers part of the reuse that copy-at-admission gives up
+  entirely: +9–15% hit rate vs headline (d) on Conv.
+- Rule (ii)'s failure comes mainly from the residue: (b) on T&A, and (d)'s
+  PCM stream.
+
+## CORRECTION NOTES (after sets A and B) — append-only; no earlier text edited
+
+**a) RETRACTED as a mechanism: "one read in PCM passes `if_read`".**
+
+- **Points back to:** "NOTE — cost metrics", "HEADLINE SET … Read-back: the
+  candidate mechanism, tested", and "De-confounded read-back test — capacity
+  only".
+- **Why it is retracted.** No PCM-served reads occurred in any
+  copy-at-admission run: `memory_hit_tokens = 0` in all 332, and
+  `memory_read_blocks = 0` in every headline / PHASE 9 (d) run. The gate was
+  opened by **lookup bookkeeping**: `MooncakeStore.lookup` credits every key it
+  walks over (`store.py:125`).
+- **What still stands.** The read-back numbers (HBF-written blocks, read back
+  in-window, never read back, and the shares of the avoided writes) stand as
+  **measurements of blocks credited as read by the lookup walk**. They are not
+  evidence about blocks read from PCM.
+
+**b) QUALIFIED: every (d) HBF variability analysis characterises the
+bookkeeping artefact, not the design.**
+
+- **Points back to:** STEP 2 (timing arms), STEP 2b (request- and burst-mode
+  replicates), the STEP 3 prelude j-size check, the STEP 3 concurrency sweep
+  and j = 0.005 check, the pooled bound, and the "outcomes cluster on a few
+  discrete values" candidate.
+- **Why.** Each of those measured how many blocks the from-zero lookup walk
+  credited while they sat in PCM. They do not measure a reuse-driven write
+  stream. Their numbers stand as measurements; their reading as properties of
+  the read-gated design does not.
+
+**c) The claim that holds in every model tested: write-back admission, config
+(c).** (c) has no read dependence: `always` demotes every victim. So it is
+untouched by the lookup bookkeeping:
+
+| model | (b) → (c) HBF reduction, Conv / T&A |
+|---|---|
+| headline (copy-at-admission, from-zero lookup, design pool, per_rank) | **50.81% / 50.99%** |
+| set A (copy-at-admission, vLLM-style lookup) | 50.81% / 50.99% (identical) |
+| set B (spill_only, vLLM-style lookup) | **50.53% / 51.31%** |
+| 86.8 GiB/GPU point (142,213, global) | 51.10% / 52.18% |
+
+**Write-back admission halving the flash write stream is the result that holds
+in every PCM entry model and lookup tested.**
+
+## Bookkeeping fixes and verification runs (V1, V2)
+
+### The fixes
+
+Both are flag-gated, stock by default, and byte-identical when off.
+
+- **`read_credit`**:
+  - `walked` (stock): every key a lookup walks over is credited as read.
+  - `served`: a key is credited only when `MooncakeStore.get` actually serves
+    its block, from either tier.
+  - Code: `mooncake/store.py` `lookup` / `get`.
+- **`load_span`**:
+  - `from_start` (stock): a load plan reads `load_info["keys"][:blocks]`.
+  - `missing`: it reads exactly the span not already hit in HBM, and the load
+    is attributed to that span's slowest tier.
+  - Code: `kv_transfer/connectors/mooncake_store.py` `_build_load_plan`,
+    `_span_tier`.
+- **New check counter, `count_if_read_gate`** (instrumentation only): at every
+  `if_read` demotion it records whether the block had at least one read served
+  from the memory (PCM) tier. Output `if_read_gate_passes` and
+  `if_read_gate_passes_pcm_served`.
+
+**Checks:**
+
+- **Tests: 263 pass** (255 + 8 in `tests/test_read_credit_load_span.py`).
+  - Under `walked`, a lookup walk alone opens the gate, with 0 PCM-served
+    reads behind it.
+  - Under `served`, a walk does not open the gate and a real read does.
+  - `missing` loads the span after the HBM hit; `from_start` loads the head.
+- **Byte identity at default:** `v_id_{b,d}_*` against `ced3806` → no diff,
+  all four.
+
+**Runs:** 71,104 per_rank, HBF 5,033,164, cap 48, both traces, **both fixes
+on**, plus `count_if_read_gate` and `count_hbf_readback`
+(`scripts/phase14/verify_fixes.sh`, table `verify_table.py`). B/req per TP
+shard; batch per active scheduler.
+
+### V1 — copy-at-admission + from-zero lookup, fixes ON (expected (d) HBF = 0)
+
+| trace | run | (d) HBF B/req | headline (fixes off) | gate passes | passes with a PCM-served read | difference | store-served tokens (PCM / HBF) |
+|---|---|---|---|---|---|---|---|
+| Conversation | unjittered | 0 | 10,543,432 | 0 | 0 | 0 | 0 / 0 |
+| Conversation | _j05_s1 | 0 | 10,543,432 | 0 | 0 | 0 | 0 / 0 |
+| Conversation | _j05_s2 | 0 | 10,241,442 | 0 | 0 | 0 | 0 / 0 |
+| Conversation | _j05_s3 | 0 | 9,677,308 | 0 | 0 | 0 | 0 / 0 |
+| Tool&Agent | unjittered | 0 | 4,082,631 | 0 | 0 | 0 | 0 / 0 |
+| Tool&Agent | _j05_s1 | 0 | 4,082,631 | 0 | 0 | 0 | 0 / 0 |
+| Tool&Agent | _j05_s2 | 0 | 4,082,631 | 0 | 0 | 0 | 0 / 0 |
+| Tool&Agent | _j05_s3 | 0 | 4,082,631 | 0 | 0 | 0 | 0 / 0 |
+
+### V2 — spill_only + vLLM-style lookup, fixes ON
+
+
+#### Conversation
+
+| config | N | HBF B/req | set B (fixes off) | PCM B/req | hit rate | store-served tokens | from PCM | HBF bytes / reuse-hit blk | gate passes | with PCM-served read | difference | end-of-run residue share | batch / active sched |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 3,224,847,254 | 3,224,847,254 | 1,631,063,114 | 0.1646 | 5,356,496 | 11.03% | 24,011,193 | — | — | — | 8.25% | 46.327 |
+| (c) | 1 | 1,595,182,416 | 1,595,182,416 | 1,632,461,390 | 0.1645 | 5,147,056 | 8.24% | 11,881,187 | — | — | — | 8.17% | 46.138 |
+| (d) | 16 | 14,800,650 – 20,724,056 | 18,806,735 – 24,434,967 | 1,759,446,565 – 1,768,017,625 | 0.1003 – 0.1028 | 635,376 – 856,448 | 78.86% – 92.33% | 179,493 – 247,431 | 28,230 – 39,528 | 28,230 – 39,528 | 0 | 8.33% – 8.44% | 44.807 – 45.257 |
+
+(b)->(c) 50.53%; (b)->(d) worst 99.36%, best 99.54% (N = 16); (d) HBF 14,800,650 – 20,724,056; hit rate (b) 0.1646 / (c) 0.1645 / (d) 0.1003 – 0.1028; (d) vs (b) -39.07% – -37.53%; batch gap (c) vs (b) -0.41%, (d) vs (b) -3.28% – -2.31%; vs set B: (b) HBF +0.00%, (c) HBF +0.00%, (b) hit +0.00%
+
+#### Tool&Agent
+
+| config | N | HBF B/req | set B (fixes off) | PCM B/req | hit rate | store-served tokens | from PCM | HBF bytes / reuse-hit blk | gate passes | with PCM-served read | difference | end-of-run residue share | batch / active sched |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (b) | 1 | 1,471,166,808 | 1,471,166,808 | 754,222,891 | 0.4013 | 1,742,192 | 19.89% | 6,301,612 | — | — | — | 16.69% | 45.775 |
+| (c) | 1 | 716,365,103 | 716,365,103 | 753,644,077 | 0.4028 | 1,759,184 | 18.86% | 3,057,323 | — | — | — | 16.75% | 45.466 |
+| (d) | 16 | 4,937,744 – 12,909,543 | 5,340,922 – 15,306,588 | 794,164,724 – 799,095,652 | 0.3704 – 0.3741 | 203,824 – 490,160 | 80.16% – 95.20% | 22,805 – 59,514 | 9,418 – 24,623 | 9,418 – 24,623 | 0 | 16.86% – 16.96% | 44.167 – 44.603 |
+
+(b)->(c) 51.31%; (b)->(d) worst 99.12%, best 99.66% (N = 16); (d) HBF 4,937,744 – 12,909,543; hit rate (b) 0.4013 / (c) 0.4028 / (d) 0.3704 – 0.3741; (d) vs (b) -7.72% – -6.80%; batch gap (c) vs (b) -0.68%, (d) vs (b) -3.51% – -2.56%; vs set B: (b) HBF +0.00%, (c) HBF +0.00%, (b) hit +0.00%
+
+### V1 — the artefact diagnosis, confirmed
+
+**Expected (d) HBF = 0; measured 0 in all 8 runs.** There are **0** `if_read`
+gate passes and **0** store-served tokens, from PCM or HBF.
+
+With honest read credit, copy-at-admission (d) at the design pool is exactly
+"drop every PCM victim". Nothing reaches HBF, nothing is ever served from the
+store, and (d)'s hit rate is its GPU-only part. The headline (d) HBF range
+(5.95–11.70 M / 4.08–6.35 M) was **entirely** produced by the lookup walk.
+
+### V2 — spill_only + vLLM-style lookup, honest bookkeeping
+
+| | Conversation | Tool&Agent |
+|---|---|---|
+| **(b) → (c)** | **50.53%** | **51.31%** |
+| **(b) → (d), worst case (N = 16)** | **99.36%** (best 99.54%) | **99.12%** (best 99.66%) |
+| (d) HBF B/req | 14,800,650 – 20,724,056 | 4,937,744 – 12,909,543 |
+| hit rate (b) / (c) / (d) | 0.1646 / 0.1645 / 0.1003–0.1028 | 0.4013 / 0.4028 / 0.3704–0.3741 |
+| **(d) hit rate vs (b)** | **−37.53% to −39.07%** | **−6.80% to −7.72%** |
+| share of store-served tokens from PCM: (b) / (c) / (d) | 11.03% / 8.24% / 78.86–92.33% | 19.89% / 18.86% / 80.16–95.20% |
+| HBF bytes per reuse-hit block: (b) / (c) / (d) | 24.0 M / 11.9 M / 179–247 k | 6.30 M / 3.06 M / 23–60 k |
+| PCM B/req: (b) / (c) / (d) | 1.631 G / 1.632 G / 1.759–1.768 G | 0.754 G / 0.754 G / 0.794–0.799 G |
+| **gate passes / with a PCM-served read / difference** | 28,230–39,528 / same / **0** | 9,418–24,623 / same / **0** |
+| end-of-run residue share (of would-be admissions) | 8.17–8.44% | 16.69–16.96% |
+| batch per active scheduler | 44.8–46.3 | 44.2–45.8 |
+| batch gap (c) / (d) vs (b) | −0.41% / −2.31% to −3.28% | −0.68% / −2.56% to −3.51% |
+
+**What the honest fixes change in set B:**
+
+- (b) and (c) are unchanged, to the byte. Their lookup and load spans were
+  already correct under `after_hbm`, and they make no read-gated decisions.
+- (d) HBF falls from 18.8–24.4 M to **14.8–20.7 M** on Conversation, and from
+  5.3–15.3 M to **4.9–12.9 M** on Tool&Agent. Credits from blocks merely
+  walked over, never served, are removed.
+- **Every remaining gate pass is backed by a real PCM-served read (difference
+  0 in all 32 (d) runs).**
+
+**What this establishes about the design,** in the only model tested where PCM
+is actually read:
+
+- PCM serves most of (d)'s store reuse: 79–95% of its store-served tokens.
+- Read-gated demotion keeps flash writes **≥ 99.12%** below the HBF-only
+  baseline.
+- The cost is a real hit-rate loss against (b): −37.5% to −39.1% (Conv) and
+  −6.8% to −7.7% (T&A).
+- (c)'s write-back halving is unchanged.
+
+These are measurements; no headline is changed here.
+
+## DECISION RECORD — new headline configuration (modelling grounds)
+
+**Decided on modelling grounds, not on the results, and recorded as such.**
+
+**HEADLINE =** `hbm_evict_save_policy = spill_only` +
+`store_lookup_start = after_hbm` + `read_credit = served` +
+`load_span = missing`, with PCM `memory_capacity_blocks = 71104`,
+`store_partition = per_rank`, `store_partition_ranks = 4`, HBF
+`ssd_capacity_blocks = 5033164`, cap 48. These are the V2 runs above.
+
+**Reasons:**
+
+1. It is the only configuration tested in which PCM serves reads: 79–95% of
+   (d)'s store-served tokens come from PCM. Under copy-at-admission, PCM served
+   none in 332 runs.
+2. It matches the vLLM connector contract: the external store is asked for
+   tokens beyond the locally computed ones.
+3. It is the intended HBM → PCM → HBF hierarchy (`CLAUDE.md`, *Scope*).
+
+**Stated plainly: it LOWERS (d)'s reduction against the old headline** —
+worst case 99.66% / 99.63% (copy-at-admission, artefact-driven) → **99.36% /
+99.12%**.
+
+**Variants retained:**
+
+- **Copy-at-admission (b) and (c)** stay as a reported variant: (b)→(c) 50.81% /
+  50.99%.
+- **Copy-at-admission (d) is recorded as equivalent to "no store".** With
+  honest bookkeeping (V1) it writes 0 to HBF and is served 0 tokens from the
+  store.
+
+## FRAMING
+
+- **The primary result is (c), write-back admission:** **~50.5–51.3% fewer HBF
+  writes in every model tested** (50.53 / 51.31% headline; 50.81 / 50.99%
+  copy-at-admission; 51.10 / 52.18% at the 86.8 GiB/GPU point), **with no
+  hit-rate cost**. (c) keeps 99.9% / 104.3% of the store's reuse benefit
+  (below).
+- **(d), read-gated demotion, is the aggressive end of a write/reuse
+  trade-off.** It removes ≥ 99.12% of HBF writes and gives up most of the
+  store's reuse benefit (below).
+
+## NO-STORE CONTROL — how much of the store's reuse benefit each config keeps
+
+Same configuration as the headline (cap 48, 30 QPS, W = 5,000, unjittered, same
+model, cluster and hardware), but with the KV connector set to `NoopConnector`:
+**no store at all** (`scripts/phase14/run_nostore.py`, `ns_*`). The hit rate is
+then the GPU-only prefix hit rate. `notdone = 0`.
+
+Retained share of the store's reuse benefit =
+**(hit_x − hit_nostore) / (hit_b − hit_nostore)**, using the headline (V2)
+runs:
+
+| trace | no-store hit rate | (b) hit | (c) hit | (d) hit range | retained (b) | retained (c) | retained (d) | no-store batch / active sched | no-store notdone |
+|---|---|---|---|---|---|---|---|---|---|
+| Conversation | 0.0885 | 0.1646 | 0.1645 | 0.1003 – 0.1028 | 100% | 99.9% | 15.4% – 18.8% | 44.953 | 0 |
+| Tool&Agent | 0.3670 | 0.4013 | 0.4028 | 0.3704 – 0.3741 | 100% | 104.3% | 9.8% – 20.6% | 44.184 | 0 |
+
+- **(c) keeps the store's reuse benefit in full:** 99.9% (Conv), 104.3% (T&A;
+  (c)'s hit rate is slightly above (b)'s).
+- **(d) keeps 15.4–18.8% (Conv) and 9.8–20.6% (T&A)** over its 16-run pool. It
+  removes ≥ 99.12% of HBF writes and gives up 80–90% of what the store adds to
+  the hit rate.
+- In absolute terms the store adds +0.0761 to the hit rate on Conversation
+  (0.0885 → 0.1646) but only +0.0343 on Tool&Agent (0.3670 → 0.4013), where
+  most reuse is already served from HBM.
+- Batch per active scheduler with no store: 44.953 / 44.184, against headline
+  (b) 46.327 / 45.775.
+
+## STEP 4 — full traces: plan and wall-time estimate (no STEP 4 run made yet)
+
+**Configuration.** The headline flag set (DECISION RECORD above), cap 48,
+30 QPS. Runs: (b), (c), and (d) unjittered + burst j = 0.05 × gap seeds 1–3,
+both traces. That is 12 runs. Each run also gets `count_hbf_readback`,
+`count_if_read_gate` and the end-of-run residue counters, so the residue share
+and the read-back share can be reported without the W = 5,000 cut.
+
+**Full traces**, built with `scripts/phase12/build_trace.py` (unchanged), all
+rows:
+
+| file | requests | md5 | first 5,000 rows |
+|---|---|---|---|
+| `conv_full.jsonl` | 12,031 | `8c528d805634be79ab24c85643127fbb` | byte-identical to `conv_5000.jsonl` (md5 `5a19d814…`) |
+| `toolagent_full.jsonl` | 23,608 | `8896cd1cb82d57cb18f6392bb9f98042` | byte-identical to `toolagent_5000.jsonl` |
+
+**The replay pace changes:**
+
+- `--trace_target_qps 30` rescales by the *whole file's* native rate, so the
+  full traces replay at a slightly different pace from the W = 5,000 files.
+- Replay-time burst gaps (`burst_gaps.py`) are 339.8–340.5 ms (Conv) and
+  666.8–668.1 ms (T&A), against 313.7 / 605.7 ms at W = 5,000.
+- **j = 0.05 × min gap is therefore 16.989 ms (Conv) and 33.338 ms (T&A).** A
+  methodology choice, not a hardware number.
+- The first 5,000 requests of a full-trace run are therefore **not** a replay
+  of the W = 5,000 run. It is a different arrival schedule, so the two are not
+  digit-comparable.
+
+**Measured basis for the estimate.** Three headline runs at W = 5,000 were
+rerun under `/usr/bin/time -v` (`mem_*`); all three reproduce their V2 runs
+exactly.
+
+| run (W = 5,000) | wall time | peak RSS |
+|---|---|---|
+| (b) Conversation | 3:29.6 (simulator 196 s) | **4.83 GiB** |
+| (b) Tool&Agent | 1:56.7 (107 s) | **2.98 GiB** |
+| (d) Tool&Agent | 1:45.3 (96 s) | **2.44 GiB** |
+
+**Estimate.** The scaling is linear in requests (×2.406 Conv, ×4.722 T&A),
+with a ×1.5 margin. The margin is there because offered load is fixed at
+30 QPS against a system that already runs ~6–15× longer than the arrival span,
+so the waiting queue, and with it per-step scheduler cost, grows with the
+trace.
+
+| run | wall, linear | wall, ×1.5 | peak RSS, linear |
+|---|---|---|---|
+| Conv (b) | 8.0 min | 12.0 min | ~11.6 GiB |
+| Conv (c) | 7.5 min | 11.2 min | ~11.6 GiB |
+| Conv (d) × 4 | 6.9 min each | 10.4 min each | ~9.5 GiB each (scaled from T&A's d/b ratio; not measured) |
+| T&A (b) | 8.7 min | 13.1 min | ~14.1 GiB |
+| T&A (c) | 8.2 min | 12.3 min | ~14.1 GiB |
+| T&A (d) × 4 | 7.8 min each | 11.7 min each | ~11.5 GiB each |
+| **all 12, serial** | **91 min** | **137 min** | — |
+
+**Memory, not CPU, is the limit.** The machine has 62 GB, but another user's
+job (`./run … lay_weight_site.yaml`) holds ~28 GB, leaving ~25–28 GB free.
+That allows **2 runs at a time**, never two T&A (b)/(c) together, for
+**~46–68 min** in total. With 3 at a time, if memory frees up: ~30–46 min.
+
+**Proposal.** Run T&A (b), the largest, first and alone as a calibration. Then
+schedule the rest by measured peak RSS.
+
+### Quoting notes (after review)
+
+- **(c)'s Tool&Agent store-benefit kept is quoted as ~100%, not 104.3%.**
+  (c)'s hit rate is 0.4028 against (b)'s 0.4013. That difference is within
+  noise and scheduling feedback; it is not an improvement over (b).
+- **Until STEP 4 settles the residue, (c) is quoted as ~48–51%.** Raw: 50.53%
+  (Conv) / 51.31% (T&A). Residue-adjusted: 48.38% (Conv). The adjustment is
+  needed because end-of-run HBM residue (8.2–8.4% / 16.7–17.0% of would-be
+  store admissions) is never spilled, so raw counts miss it. If it would
+  eventually be demoted to HBF under (c), the raw reduction overstates.
+
+## STEP 4 — full traces, headline configuration
+
+**Configuration.** The headline flag set (spill_only, `after_hbm`,
+`read_credit = served`, `load_span = missing`, PCM 71,104 per_rank 4 × 17,776,
+HBF 5,033,164 per_rank 4 × 1,258,291), cap 48, 30 QPS, **full traces**:
+`conv_full.jsonl` (12,031 requests) and `toolagent_full.jsonl` (23,608; md5s
+in the STEP 4 plan above).
+
+**Runs, 14:**
+
+- (b), (c), (d) unjittered;
+- (d) burst jitter j = 0.05 × gap, **16.989 ms (Conv), 33.338 ms (T&A)**,
+  seeds 1–3;
+- one **no-store** run (`NoopConnector`) per trace.
+
+**Model and settings:** `LLaMa2-70B-GQA` (Nhead 64, KV heads 8, Nlayer 80,
+Dmodel 8192), FP16, 163,840 B/token at TP2, block 2,621,440 B, TP2/DP4, 4
+writing TP-0 ranks, `H3-B200-KVONLY` (pre-compensated `Capacity`). The workload
+is a **stand-in for CAG**. B/req are per TP shard; batch is per active
+scheduler.
+
+**Calibration (pre-registered stop: wall or RSS > 1.5 × estimate).** T&A (b)
+ran alone first: **8:42.4 wall, 11.13 GiB peak**, against an estimate of
+8.7 min and ~14.1 GiB. Within bounds, so the rest went 2 at a time under
+`scripts/phase14/step4_schedule.py`: memory-gated, never two T&A (b)/(c)
+together.
+
+| run | wall | peak RSS |
+|---|---|---|
+| T&A (b) / (c) | 8:42 / 8:09 | 11.13 / 11.14 GiB |
+| T&A (d) × 4 | 7:31–7:35 | 8.98–9.00 GiB |
+| Conv (b) / (c) | 8:03 / 7:25 | 9.63 / 9.62 GiB |
+| Conv (d) × 4 | 6:47–6:51 | 7.46–7.48 GiB |
+| no-store Conv / T&A | 2:55 / 3:32 | 4.66 / 6.30 GiB |
+
+- `notdone = 0` in all 14 runs.
+- Total wall time 54 min (09:51–10:45).
+
+### Numbers — full trace against W = 5,000, by metric
+
+The W = 5,000 column uses the same 4-run (d) composition (`v2_d` +
+`v2_d_j05_s{1,2,3}`). **The replay pace and the jitter values differ** (STEP 4
+plan), so compare **by metric, not by digits.**
+
+#### Conversation — full trace (12,031 requests) vs W = 5,000 (by metric)
+
+| metric | full trace | W = 5,000 (same 4-run (d) composition) |
+|---|---|---|
+| (b) → (c), raw | 50.23% | 50.53% |
+| (b) → (c), residue-adjusted | 49.29% | 48.38% |
+| (b) → (d), worst / best (N = 4) | 99.45% / 99.52% | 99.36% / 99.46% |
+| (b) HBF B/req | 3,036,078,553 | 3,224,847,254 |
+| (c) HBF B/req | 1,511,160,257 | 1,595,182,416 |
+| (d) HBF B/req range | 14,628,947 – 16,642,690 | 17,453,023 – 20,724,056 |
+| hit rate (b) / (c) / (d) | 0.1898 / 0.1898 / 0.1006 – 0.1019 | 0.1646 / 0.1645 / 0.1018 – 0.1026 |
+| no-store hit rate | 0.0916 | 0.0885 |
+| (d) hit rate vs (b) | -47.00% – -46.33% | -38.12% – -37.64% |
+| store benefit kept (c) / (d) | 100.1% / 9.2% – 10.5% | 99.9% / 17.5% – 18.5% |
+| PCM-served share of store-served tokens (b) / (c) / (d) | 6.92% / 6.28% / 72.59% – 76.45% | 11.03% / 8.24% / 83.88% – 84.34% |
+| HBF bytes per reuse-hit block (b) / (c) / (d) | 21,281,639 / 10,589,577 / 193,464 – 217,357 | 24,011,193 / 11,881,187 / 209,267 – 247,431 |
+| PCM B/req (b) / (c) / (d) | 1,525,785,718 / 1,526,653,140 / 1,702,763,967 – 1,705,810,947 | 1,631,063,114 / 1,632,461,390 / 1,759,446,565 – 1,760,523,452 |
+| end-of-run residue share (b) / (c) / (d) | 3.76% / 3.70% / 3.78% – 3.82% | 8.25% / 8.17% / 8.42% – 8.44% |
+| HBF read-back share (b) / (c) / (d) | 4.61% / 9.24% / 23.66% – 25.47% | 3.89% / 8.10% / 20.32% – 20.91% |
+| (d) gate passes / with PCM-served read | 67,139 – 76,381 / 67,139 – 76,381 (diff 0) | 33,289 – 39,528 / 33,289 – 39,528 (diff 0) |
+| batch / active sched (b) / (c) / (d) / no-store | 47.089 / 47.105 / 46.778 – 46.814 / 46.699 | 46.327 / 46.138 / 44.963 – 45.011 / 44.953 |
+| batch gap (c) vs (b) / (d) vs (b) | +0.03% / -0.66% – -0.59% | -0.41% / -2.94% – -2.84% |
+
+residue-share expectation (W = 5,000 share x 5,000 / 12,031): (b) 3.43%, (c) 3.40%
+
+#### Tool&Agent — full trace (23,608 requests) vs W = 5,000 (by metric)
+
+| metric | full trace | W = 5,000 (same 4-run (d) composition) |
+|---|---|---|
+| (b) → (c), raw | 50.25% | 51.31% |
+| (b) → (c), residue-adjusted | 49.26% | 46.49% |
+| (b) → (d), worst / best (N = 4) | 99.33% / 99.36% | 99.47% / 99.64% |
+| (b) HBF B/req | 1,466,116,938 | 1,471,166,808 |
+| (c) HBF B/req | 729,379,925 | 716,365,103 |
+| (d) HBF B/req range | 9,319,615 – 9,769,217 | 5,271,716 – 7,816,610 |
+| hit rate (b) / (c) / (d) | 0.4510 / 0.4511 / 0.3959 – 0.3966 | 0.4013 / 0.4028 / 0.3722 – 0.3741 |
+| no-store hit rate | 0.3870 | 0.3670 |
+| (d) hit rate vs (b) | -12.21% – -12.05% | -7.26% – -6.80% |
+| store benefit kept (c) / (d) | 100.2% / 13.9% – 15.1% | 104.3% / 15.2% – 20.6% |
+| PCM-served share of store-served tokens (b) / (c) / (d) | 7.22% / 6.58% / 71.31% – 73.93% | 19.89% / 18.86% / 84.61% – 87.84% |
+| HBF bytes per reuse-hit block (b) / (c) / (d) | 6,056,370 / 3,012,341 / 43,835 – 45,883 | 6,301,612 / 3,057,323 / 24,348 – 35,923 |
+| PCM B/req (b) / (c) / (d) | 737,006,175 / 737,275,336 / 815,238,081 – 816,065,665 | 754,222,891 / 753,644,077 / 794,164,724 – 796,696,510 |
+| end-of-run residue share (b) / (c) / (d) | 3.91% / 3.87% / 3.95% – 3.97% | 16.69% / 16.75% / 16.90% – 16.92% |
+| HBF read-back share (b) / (c) / (d) | 4.18% / 8.56% / 22.32% – 25.69% | 2.99% / 6.12% / 9.87% – 14.32% |
+| (d) gate passes / with PCM-served read | 83,930 – 87,979 / 83,930 – 87,979 (diff 0) | 10,055 – 14,909 / 10,055 – 14,909 (diff 0) |
+| batch / active sched (b) / (c) / (d) / no-store | 45.626 / 45.443 / 44.685 – 44.776 / 44.591 | 45.775 / 45.466 / 44.167 – 44.189 / 44.184 |
+| batch gap (c) vs (b) / (d) vs (b) | -0.40% / -2.06% – -1.86% | -0.68% / -3.51% – -3.47% |
+
+residue-share expectation (W = 5,000 share x 5,000 / 23,608): (b) 3.53%, (c) 3.55%
+
+### NEW REGIME on full traces: HBF fills in (b) and (c)
+
+At W = 5,000 `ssd_eviction_count = 0` everywhere. On the full traces the HBF
+partitions (1,258,291 blocks per writing rank, 3 TiB per writing GPU) **fill**:
+
+| | HBF blocks written | written ÷ pool (5,033,164) | **HBF evictions** | evicted ÷ written |
+|---|---|---|---|---|
+| (b) Conv | 13,933,968 | 2.77 | **1,969,372** | 14.1% |
+| (c) Conv | 6,935,413 | 1.38 | **1,902,249** | 27.4% |
+| (d) Conv | 67,139–72,771 | 0.01 | **0** | 0% |
+| (b) T&A | 13,203,464 | 2.62 | **1,604,120** | 12.1% |
+| (c) T&A | 6,568,604 | 1.31 | **1,535,440** | 23.4% |
+| (d) T&A | 86,701–87,979 | 0.02 | **0** | 0% |
+
+What this means for reading the numbers:
+
+- **(b) and (c) now run with a capacity-bound flash tier.** Blocks evicted
+  from HBF can no longer be served. And a key evicted from HBF leaves the
+  store (`store.py:555` `_drop_offload_victims`), so its next HBM spill re-admits
+  it to PCM and, under (b)/(c), writes it to HBF again.
+- Every (b)/(c) HBF byte count on the full traces therefore includes
+  **re-writes forced by HBF capacity**.
+- (d) is untouched.
+- This is recorded, not corrected. Capacity is the sourced design value.
+- `CLAUDE.md`'s "HBF never evicts" applies to W = 5,000 only.
+
+### Pre-registered expectation — residue share
+
+**Expected:** it falls roughly in proportion to request count, to ~3.5%:
+W = 5,000 share × 5,000 / N gives 3.40–3.43% (Conv) and 3.53–3.55% (T&A).
+
+**Measured:** **3.70–3.82% (Conv), 3.87–3.97% (T&A).**
+
+**It does fall roughly in proportion:** 8.2–8.4% → 3.7–3.8%, and 16.7–16.9% →
+3.9–4.0%. The measured shares sit about 9–12% above the proportional
+expectation. That fits a residue that is fixed in blocks (HBM is full of keyed
+blocks at the end: ~311 k, 4 × 78,643 = 314,572) against a store-admission
+count that grows slightly less than linearly.
+
+**(c), raw and residue-adjusted, side by side. The gap shrinks as expected:**
+
+| | W = 5,000 raw / adjusted / gap | **full trace raw / adjusted / gap** |
+|---|---|---|
+| Conversation | 50.53% / 48.38% / 2.15 pt | **50.23% / 49.29% / 0.94 pt** |
+| Tool&Agent | 51.31% / 46.49% / 4.82 pt | **50.25% / 49.26% / 0.99 pt** |
+
+**(c) on full traces is ~49.3–50.3%** on both traces.
+
+### Read-back share without the window cut
+
+These shares are still cut at the end of the trace, so they remain lower
+bounds; they no longer have the W = 5,000 cut.
+
+| | W = 5,000 | **full trace** |
+|---|---|---|
+| (b) | 3.89% (Conv) / 2.99% (T&A) | **4.61% / 4.18%** |
+| (c) | 8.10% / 6.12% | **9.24% / 8.56%** |
+| (d) | 20.32–20.91% / 9.87–14.32% | **23.66–25.47% / 22.32–25.69%** |
+
+All rise when the window is removed. This is consistent with W = 5,000 cutting
+off late reads. Even uncut, (b) reads back < 5% of what it writes to HBF.
+
+### What moved between W = 5,000 and the full trace (flagged, not smoothed)
+
+**Movements:**
+
+- **The store's reuse benefit is larger on full traces**, because reuse beyond
+  request 5,000 is no longer censored.
+  - (b) hit rate 0.1646 → **0.1898** (Conv) and 0.4013 → **0.4510** (T&A).
+  - No-store hit rate: 0.0885 → 0.0916 and 0.3670 → 0.3870.
+- **(d) keeps less of that benefit:** **9.2–10.5% (Conv), 13.9–15.1% (T&A)**,
+  against 17.5–18.5% / 15.2–20.6% at W = 5,000.
+- **(d)'s hit-rate cost vs (b) is larger:** **−46.3% to −47.0%** (Conv) and
+  **−12.1% to −12.2%** (T&A), against −37.6% to −38.1% and −6.8% to −7.3%.
+- **(c) keeps ~100% (100.1% / 100.2%).**
+- **(d) HBF B/req moves in opposite directions on the two traces.**
+  - Conv: 17.5–20.7 M → **14.6–16.6 M**, down.
+  - T&A: 5.3–7.8 M → **9.3–9.8 M**, up.
+- The worst-case (b)→(d) reduction stays **≥ 99.33%**: 99.45% Conv, 99.33% T&A.
+- The PCM-served share of store-served tokens falls for every config:
+  - (d): 84% → 73–76% (Conv) and 85–88% → 71–74% (T&A).
+  - (b): 11.0% → 6.9% and 19.9% → 7.2%.
+  - More reuse now reaches back to blocks that have already left PCM.
+- **Batch gaps shrink.** (d) vs (b): −2.84% to −2.94% → −0.59% to −0.66% (Conv),
+  and −3.47% to −3.51% → −1.86% to −2.06% (T&A).
+- **The (d) gate check stays clean:** 67–76 k and 84–88 k passes, every one
+  with a PCM-served read (difference 0).
+
+## Code reading — is a block served from HBF re-admitted to PCM on its way back to HBM?
+
+**No. In no configuration does the HBF → HBM read path write PCM.**
+
+| step | code | effect |
+|---|---|---|
+| load | `MooncakeStoreConnector.start_load_kv` → `store.get` (`kv_transfer/connectors/mooncake_store.py:407-415`) | — |
+| HBF serve | `MooncakeStore.get` (`mooncake/store.py:161-186`): an HBF-tier object is read with `self.offload.read(obj.key)` (`:179-182`) | `obj.tier` stays `"ssd"`. No memory-tier admission, no `_record_memory_write`, no PCM bytes |
+| LRU touch | `_touch` (`store.py:392-396`) | moves the PCM LRU only for memory-tier objects (`:395`); `OffloadTier.read` refreshes the HBF LRU (`mooncake/ssd.py:58-59`) |
+| block later evicted from HBM (spill_only) | `_on_hbm_evict` → `missing_indices` (`mooncake_store.py:243`) → `put_with_timing` (`:259`) → `_put_one`: if the key is still in the store, `_touch` and return zero bytes (`store.py:234-237`) | no PCM write while the key remains stored |
+| copy-at-admission variant | prefill save prefiltered by `missing_indices` (`mooncake_store.py:601`) | present keys never rewritten |
+
+**The read path in the paper should therefore be: HBF → HBM directly, PCM
+bypassed.** PCM is written only by keys **absent** from the store, which
+happens in three ways:
+
+1. First-time spills.
+2. **(d) only:** re-spills of keys `if_read` dropped (`store.py:354-363`, popped
+   at `:363` when no HBF copy exists).
+3. **Full traces, (b)/(c):** re-spills of keys **evicted from HBF**
+   (`_drop_offload_victims`, `store.py:555`). Not possible at W = 5,000, where HBF never
+   evicts.
+
+**How much of (d)'s PCM writes are re-admissions?** This is an estimate from
+existing counters, not a dedicated counter.
+
+- **At W = 5,000** (V2; no HBF evictions anywhere, so (c) never loses a key and
+  its absent-spill count is the first-time-spill count): (d) absent spills −
+  (c) absent spills = **242,205–258,553 blocks (Conv) = 7.2–7.7% of (d)'s PCM
+  writes**, and **77,287–86,692 (T&A) = 5.1–5.7%**. Caveat: (c) and (d) run
+  slightly different schedules.
+- **On full traces the same subtraction is not valid.** (c) loses 1.90 M /
+  1.54 M keys to HBF evictions and re-admits them, so its absent count is no
+  longer first-time-only. The raw difference, 0.81 M / 0.70 M = 10.3–10.5% /
+  9.6–9.7%, is **not** an estimate of (d)'s re-admissions.
+- **A dedicated counter would settle it:** an admission of a key the store has
+  admitted before. Not built.
+
+## CORRECTION NOTE — where "HBF never evicts" is written (refers to STEP 4, "NEW REGIME")
+
+The STEP 4 entry above says "`CLAUDE.md`'s 'HBF never evicts' applies to
+W = 5,000 only". **CLAUDE.md never said that.** The claim is in this file:
+PHASE 14 STEP 1 "1g — addition to 1a: the shared HBF LRU never evicts", and
+the STEP 3b note ("HBF never evicts in any run so far"). Both hold at
+W = 5,000 only. On the full traces (b) and (c) evict from HBF (1.5–2.0 M
+evictions) and (d) does not. CLAUDE.md now states this (2026-10-12).
+
+## AFTER STEP 4 — decisions (2026-10-12)
+
+1. **Headline window = full traces** (STEP 4). W = 5,000 is kept as the earlier
+   reference. Quote:
+   - (c) as **~49–50%**. Raw and residue-adjusted values have converged:
+     50.23 / 49.29 (Conv), 50.25 / 49.26 (T&A).
+   - (d) worst case **99.45 / 99.33%**, with hit rate **−47% / −12%** vs (b)
+     and store benefit kept **9–15%**.
+2. **(b) is described exactly, not as "HBF only".** It is a **71,104-block
+   write-through DRAM buffer in front of HBF**, and on the full traces that
+   buffer serves **6.9% / 7.2%** of (b)'s store-served tokens.
+3. **Read path:** PCM or HBF serve directly into HBM. An HBF hit is not
+   re-admitted to PCM (`store.py:179-182`, `:234-237`).
+4. Remaining order:
+   - the HBF capacity check below (STOP);
+   - the single LaTeX rewrite (STOP before commit);
+   - STEP 5 (content-aligned tail);
+   - STEP 6 (shared far-tier bandwidth: ASSUMED 30 / 48 GB/s per stack =
+     27.94 / 44.70 GiB/s).
+   STEP 5 and STEP 6 are sensitivity sections.
+
+## HBF CAPACITY CHECK — is (c)'s halving driven by HBF capacity?
+
+### Flags (both stock by default)
+
+| flag | values (stock first) | effect |
+|---|---|---|
+| `hbf_capacity_mode` | `finite` \| `unlimited` | `unlimited`: the offload tier never evicts and never refuses a write (`mooncake/ssd.py` `OffloadTier.write`). **A SENSITIVITY setting, not a hardware value.** HBF dies per stack is OPEN; capacity per stack (384 GB) is sourced. The capacity knob is still read, and the peak the tier actually held is reported: `hbf_capacity_configured_blocks`, `hbf_capacity_peak_used_blocks` (pool), `hbf_capacity_rank_peak_used_blocks_max` |
+| `count_pcm_admit_source` | `false` \| `true` | Instrumentation only. Every memory-tier (PCM) admission is tagged by why its key was absent from the store: `pcm_admit_first_blocks` (never stored), `pcm_admit_after_if_read_drop_blocks` (dropped by `if_read`, `store.py` eviction path), `pcm_admit_after_hbf_evict_blocks` (only copy evicted from HBF, `_drop_offload_victims`), `pcm_admit_after_other_blocks` (expected 0). The four sum to `mooncake_memory_write_blocks` |
+
+Both are merged into `result_dict` after `asdict()` through
+`OPTIONAL_MOONCAKE_KEY_PREFIXES` (`pcm_admit_`, `hbf_capacity_`), so stock output
+gains no keys. `hbf_capacity_mode` is added to the offload profile only when it
+is not `finite`.
+
+**Tests: 277 pass.** That is 263 pre-existing and unchanged, plus 14 new:
+
+- `tests/test_hbf_capacity_mode.py` (6):
+  - default and reject;
+  - finite evicts while unlimited does not, with the same bytes written;
+  - identical behaviour when capacity never binds;
+  - per-rank peaks;
+  - export prefix.
+- `tests/test_pcm_admit_source.py` (8):
+  - default off;
+  - first admissions;
+  - a refresh is not an admission;
+  - re-admission after an `if_read` drop;
+  - re-admission after an HBF eviction;
+  - an HBF-served block is not re-admitted;
+  - the four counters sum to the memory writes, and the counter changes
+    nothing;
+  - export prefix.
+
+### Runs (`scripts/phase14/hbfcap_schedule.py`, log `tmp/phase14/hbfcap.log`)
+
+All runs use the full traces, the headline configuration and cap 48, at
+30 QPS. `count_hbf_readback`, `count_if_read_gate` and `count_pcm_admit_source`
+are on.
+
+| tags | what | purpose |
+|---|---|---|
+| `hc_u_{b,c}_{conv,ta}` | `hbf_capacity_mode = unlimited` | **the check** (4 runs) |
+| `hc_f_{b,c,d}_{conv,ta}` | finite (headline) | The admission counter on the headline runs. They must reproduce `s4_{b,c,d}_*` exactly on every other key |
+| `hc_id_{b,d}_{conv,ta}` | new code, every flag at default, W = 5,000 | byte identity against `ced3806` (`s0_*`) |
+
+(d) is not run with unlimited HBF. On the full traces (d) evicts nothing from
+HBF, so the capacity knob never binds and the mode cannot change it. That is
+the property tested by `test_identical_when_capacity_never_binds`.
+
+### Pre-registered rule (set before any result)
+
+If (b)→(c) under unlimited HBF is **within 5 points** of the finite-HBF value,
+then **"(c)'s halving is not driven by HBF capacity."** Otherwise both values
+are reported, together with the dependence on HBF capacity (dies per stack is
+OPEN).
+
+### Analytic expectation, recorded before the results (an identity, not a fit)
+
+The STEP 4 counters satisfy two identities exactly, on all four full-trace
+(b)/(c) runs:
+
+- **(b):** HBF write blocks = PCM admissions + PCM demotions.
+  - Conv: 13,933,968 = 7,002,536 + 6,931,432.
+  - T&A: 13,203,464 = 6,637,284 + 6,566,180.
+- **(c):** HBF write blocks = PCM demotions.
+  - Conv: 6,935,413.
+  - T&A: 6,568,604.
+
+Why:
+
+- (b) writes every admission through to HBF and writes the block again when
+  the DRAM buffer demotes it (`store.py` `_put_one` write-through branch and
+  `_evict_memory_lru`). `OffloadTier.write` counts the second write in full,
+  even when the key is still on HBF.
+- (c) writes HBF only at demotion.
+- Demotions = admissions − end-of-run buffer occupancy (≤ 71,104).
+
+So **(b)→(c) = 1 − dem_c / (adm_b + dem_b) ≈ 50% − (a term ≤ 71,104 /
+(adm + dem))**, provided (b) and (c) admit about the same number of blocks.
+Raising HBF capacity changes the admission count, since the re-admissions that
+follow HBF evictions disappear. It does not change the structure.
+**Expected: the rule passes by a wide margin.**
+
+This also means **(b)→(c) is a write-policy effect, write-through vs
+write-back**, not a property of PCM media. Under these counters, a write-back
+DRAM buffer of the same size would write the same HBF bytes, up to the small
+schedule feedback from media timing: `memory_media` changes timing only
+(`store.py` `_memory_media_latency`). This
+is recorded here as an observation; the framing decision is the user's.
+
+### Results
+
+Code: the commit containing this entry, on branch `phase14-fixes`, parent
+`6590989`. Trace md5s:
+
+| trace | md5 |
+|---|---|
+| conv_full | `8c528d805634be79ab24c85643127fbb` |
+| toolagent_full | `8896cd1cb82d57cb18f6392bb9f98042` |
+| conv_5000 | `5a19d814562e650fe6e44e4234a4793c` |
+| toolagent_5000 | `c6cd3b0c8022eebb88358719a2596f1c` |
+
+Hardware json md5: `9b4cba823dd4158d9bd3efe16bf74491`. Model LLaMa2-70B-GQA
+(Nhead 64, KV heads 8, Nlayer 80, Dmodel 8192), FP16, 163,840 B/token at TP2,
+block 2,621,440 B, TP2/DP4. Workload: Mooncake FAST'25 traces, a stand-in for
+CAG.
+
+**Gates.**
+
+- **Byte identity at default:** `hc_id_{b,d}_{conv,ta}` against `ced3806`
+  (`s0_*`), using the PHASE 12 strip() → **no diff in all 4**.
+- **The counter changes nothing:** `hc_f_{b,c,d}_{conv,ta}` against STEP 4's
+  `s4_*` → **no diff in all 6** on every key except the four added
+  `pcm_admit_*` keys.
+- All 14 runs finished with rc 0 and `notdone = 0`. The 10 full-trace runs
+  took 6:50–9:05 each, with peak RSS 8.5–12.4 GiB (unlimited (b) T&A was
+  12.36 GiB). Total time
+  46 min, at most 2 runs at a time.
+
+**Batch:** the arms are matched. Per active scheduler, unlimited vs finite
+differs by ≤ 0.07%. Within each mode, (c) vs (b) differs by +0.03% / −0.40%,
+as in STEP 4.
+
+#### Conversation — finite vs unlimited HBF (full trace, headline configuration)
+
+| metric | finite (b) | finite (c) | unlimited (b) | unlimited (c) |
+|---|---|---|---|---|
+| HBF B/req | 3,036,078,553 | 1,511,160,257 | 3,035,241,854 | 1,510,832,550 |
+| HBF write blocks | 13,933,968 | 6,935,413 | 13,930,128 | 6,933,909 |
+| PCM admissions (blocks) | 7,002,536 | 7,006,517 | 7,000,616 | 7,005,013 |
+| PCM demotions (blocks) | 6,931,432 | 6,935,413 | 6,929,512 | 6,933,909 |
+| PCM B/req | 1,525,785,718 | 1,526,653,140 | 1,525,367,368 | 1,526,325,433 |
+| hit rate | 0.1898 | 0.1898 | 0.1900 | 0.1900 |
+| store-served tokens | 15,588,992 | 15,317,840 | 15,619,712 | 15,341,904 |
+| PCM-served share of store-served tokens | 6.92% | 6.28% | 6.90% | 6.27% |
+| HBF evictions | 1,969,372 | 1,902,249 | 0 | 0 |
+| batch / active sched | 47.089 | 47.105 | 47.103 | 47.118 |
+| HBF peak held, pool / largest rank (unlimited only) | — | — | 7,000,616 (1.39× pool) / 1,775,224 (1.41× rank) | 6,933,909 (1.38× pool) / 1,752,372 (1.39× rank) |
+
+(b)->(c) raw: finite 50.23%, unlimited 50.22% (diff -0.00 pt); residue-adjusted: finite 49.29%, unlimited 49.29% (diff -0.00 pt). Rule (|diff| <= 5 pt): PASS
+unlimited vs finite: (b) HBF B/req -0.03%, (c) -0.02%; hit (b) +0.10%, (c) +0.08%; identities (b) HBF = adm + dem, (c) HBF = dem: hold in all 4
+
+##### Conversation — PCM admissions by source (count_pcm_admit_source)
+
+| run | PCM admissions | first | after if_read drop | after HBF eviction | other | sum check |
+|---|---|---|---|---|---|---|
+| finite (b) | 7,002,536 | 7,000,616 (99.97%) | 0 (0.00%) | 1,920 (0.03%) | 0 (0.00%) | ok |
+| finite (c) | 7,006,517 | 7,005,013 (99.98%) | 0 (0.00%) | 1,504 (0.02%) | 0 (0.00%) | ok |
+| finite (d) | 7,828,755 | 7,009,652 (89.54%) | 819,103 (10.46%) | 0 (0.00%) | 0 (0.00%) | ok |
+| unlimited (b) | 7,000,616 | 7,000,616 (100.00%) | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) | ok |
+| unlimited (c) | 7,005,013 | 7,005,013 (100.00%) | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) | ok |
+
+#### Tool&Agent — finite vs unlimited HBF (full trace, headline configuration)
+
+| metric | finite (b) | finite (c) | unlimited (b) | unlimited (c) |
+|---|---|---|---|---|
+| HBF B/req | 1,466,116,938 | 729,379,925 | 1,464,795,114 | 728,719,013 |
+| HBF write blocks | 13,203,464 | 6,568,604 | 13,191,560 | 6,562,652 |
+| PCM admissions (blocks) | 6,637,284 | 6,639,708 | 6,631,332 | 6,633,756 |
+| PCM demotions (blocks) | 6,566,180 | 6,568,604 | 6,560,228 | 6,562,652 |
+| PCM B/req | 737,006,175 | 737,275,336 | 736,345,263 | 736,614,424 |
+| hit rate | 0.4510 | 0.4511 | 0.4515 | 0.4516 |
+| store-served tokens | 13,708,000 | 13,822,448 | 13,815,520 | 13,929,968 |
+| PCM-served share of store-served tokens | 7.22% | 6.58% | 7.16% | 6.52% |
+| HBF evictions | 1,604,120 | 1,535,440 | 0 | 0 |
+| batch / active sched | 45.626 | 45.443 | 45.595 | 45.416 |
+| HBF peak held, pool / largest rank (unlimited only) | — | — | 6,631,332 (1.32× pool) / 1,729,870 (1.37× rank) | 6,562,652 (1.30× pool) / 1,713,083 (1.36× rank) |
+
+(b)->(c) raw: finite 50.25%, unlimited 50.25% (diff +0.00 pt); residue-adjusted: finite 49.26%, unlimited 49.27% (diff +0.00 pt). Rule (|diff| <= 5 pt): PASS
+unlimited vs finite: (b) HBF B/req -0.09%, (c) -0.09%; hit (b) +0.11%, (c) +0.11%; identities (b) HBF = adm + dem, (c) HBF = dem: hold in all 4
+
+##### Tool&Agent — PCM admissions by source (count_pcm_admit_source)
+
+| run | PCM admissions | first | after if_read drop | after HBF eviction | other | sum check |
+|---|---|---|---|---|---|---|
+| finite (b) | 6,637,284 | 6,631,332 (99.91%) | 0 (0.00%) | 5,952 (0.09%) | 0 (0.00%) | ok |
+| finite (c) | 6,639,708 | 6,633,756 (99.91%) | 0 (0.00%) | 5,952 (0.09%) | 0 (0.00%) | ok |
+| finite (d) | 7,349,273 | 6,630,899 (90.23%) | 718,374 (9.77%) | 0 (0.00%) | 0 (0.00%) | ok |
+| unlimited (b) | 6,631,332 | 6,631,332 (100.00%) | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) | ok |
+| unlimited (c) | 6,633,756 | 6,633,756 (100.00%) | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) | ok |
+
+### Verdict against the pre-registered rule
+
+| | finite HBF | unlimited HBF | difference |
+|---|---|---|---|
+| Conv (b)→(c), raw | 50.23% | 50.22% | −0.00 pt |
+| Conv (b)→(c), residue-adjusted | 49.29% | 49.29% | −0.00 pt |
+| T&A (b)→(c), raw | 50.25% | 50.25% | +0.00 pt |
+| T&A (b)→(c), residue-adjusted | 49.26% | 49.27% | +0.00 pt |
+
+**Rule passes, on both traces, raw and residue-adjusted: "(c)'s halving is not
+driven by HBF capacity."** As expected from the identity recorded above, which
+holds exactly in all 4 unlimited runs as well.
+
+### What else the check shows (numbers first)
+
+1. **HBF evictions barely change the write stream.** Making HBF unlimited:
+   - removes all 1.97 M / 1.60 M ((b)) and 1.90 M / 1.54 M ((c)) HBF
+     evictions;
+   - changes HBF B/req by only **−0.03% / −0.09%** ((b)) and **−0.02% /
+     −0.09%** ((c));
+   - raises hit rate by **+0.08% to +0.11%**.
+
+   The admission counter shows why. Re-admissions after an HBF eviction are
+   only **1,920 / 5,952** blocks in (b) and **1,504 / 5,952** in (c), i.e.
+   **0.02–0.09%** of PCM admissions. Almost every key HBF evicts is never
+   spilled again.
+2. **How much HBF the full traces would need.** With no capacity limit, HBF
+   holds up to:
+   - **7,000,616 blocks** ((b) Conv) = **1.39× the 5,033,164-block pool**, and
+     1.41× a rank's 1,258,291 at the largest rank;
+   - **6,631,332** ((b) T&A) = **1.32×**, and 1.37× at the largest rank.
+
+   This is the distinct-key footprint of the trace. In both unlimited runs it
+   equals the first-admission count exactly. It is an occupancy, not a
+   capacity recommendation; HBF dies per stack stays OPEN.
+3. **PCM admissions by source, headline (finite) runs:**
+
+   | | first | after an `if_read` drop | after an HBF eviction | other |
+   |---|---|---|---|---|
+   | (b) | 99.97% / 99.91% | 0 | 0.03% / 0.09% | 0 |
+   | (c) | 99.98% / 99.91% | 0 | 0.02% / 0.09% | 0 |
+   | (d) (unjittered run, N = 1) | **89.54% / 90.23%** | **10.46% / 9.77%** | 0 | 0 |
+
+   - In (d), 819,103 / 718,374 PCM admissions are re-spills of keys `if_read`
+     dropped. That is **10.7% / 10.0%** of (d)'s 7,690,512 / 7,191,468 dropped
+     blocks.
+   - The "other" category is 0 in every run, so the three named sources
+     account for every PCM write.
+   - Jittered (d) runs did not carry the counter, so (d)'s shares are N = 1.
+
+## CORRECTION NOTES — refer to STEP 4 ("NEW REGIME" and "Code reading"); no earlier text edited
+
+- **"Every (b)/(c) HBF byte count on the full traces therefore includes
+  re-writes forced by HBF capacity"** (STEP 4, NEW REGIME) overstates the
+  effect.
+  - The re-writes exist, but they are **0.02–0.09%** of PCM admissions and
+    move HBF B/req by **≤ 0.09%** (measured above).
+  - HBF capacity changes **what HBF holds**: 1.5–2.0 M cold keys are evicted
+    and lost, which costs ~0.1% hit rate. It does **not** change **how much
+    is written** to any material extent.
+- **"On full traces the same subtraction is not valid"** (Code reading). In
+  practice (c)'s re-admissions after HBF eviction are only 1,504 / 5,952
+  blocks.
+  - So the raw difference quoted there, 10.3–10.5% / 9.6–9.7% of (d)'s PCM
+    writes, was close to the direct measurement.
+  - The direct measurement is **10.46% / 9.77%** (unjittered (d)).
+  - The dedicated counter is now the number to quote.

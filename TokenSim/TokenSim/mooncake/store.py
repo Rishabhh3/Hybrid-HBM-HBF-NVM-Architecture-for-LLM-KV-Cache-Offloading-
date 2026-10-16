@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from TokenSim.mooncake.config import MooncakeConfig
 from TokenSim.mooncake.metrics import MooncakeStats
 from TokenSim.mooncake.pool_key import PoolKey
-from TokenSim.mooncake.ssd import OffloadTier
+from TokenSim.errors import ConfigurationError
+from TokenSim.mooncake.ssd import OffloadTier, PartitionedOffloadTier
 
 _GB = 1 << 30
 
@@ -26,6 +27,11 @@ class StoreObject:
     read_count: int = 0
     # Simulated time of the put that admitted this object, for residency.
     write_time: float = 0.0
+    # Owning rank index (store_partition != "global" only).
+    rank: int | None = None
+    # Reads actually served from the memory tier (MooncakeStore.get), whatever
+    # read_credit says; feeds the count_if_read_gate check only.
+    pcm_served_reads: int = 0
 
 
 @dataclass
@@ -66,11 +72,47 @@ class MooncakeStore:
         self.objects: dict[str, StoreObject] = {}
         self.memory_lru: OrderedDict[str, None] = OrderedDict()
         self.stats = MooncakeStats()
-        self.offload = OffloadTier(config, self.block_bytes) if config.enable_offload else None
+        self._count_readback = bool(config.count_hbf_readback)
+        self._credit_on_serve = config.read_credit == "served"
+        if config.count_if_read_gate:
+            self.stats.if_read_gate_reporting = 1
+        # key -> True while its latest offload copy has not been read back.
+        self._hbf_unread: dict[str, bool] = {}
+        if self._count_readback:
+            self.stats.hbf_readback_reporting = 1
+        # count_pcm_admit_source: keys ever stored, and for keys that left the
+        # store, why they left (the latest departure wins).
+        self._count_admit_source = bool(config.count_pcm_admit_source)
+        self._seen_keys: set[str] = set()
+        self._departed: dict[str, str] = {}
+        if self._count_admit_source:
+            self.stats.pcm_admit_reporting = 1
+        self._hbf_unlimited = config.hbf_capacity_mode == "unlimited"
+        self._partitioned = config.store_partition != "global"
+        self._per_rank = config.store_partition == "per_rank"
+        if self._partitioned:
+            self._init_partitions()
+        if not config.enable_offload:
+            self.offload = None
+        elif self._per_rank:
+            self.offload = PartitionedOffloadTier(
+                config,
+                self.block_bytes,
+                config.store_partition_ranks,
+                self._key_rank.get,
+            )
+            self.stats.partition_rank_ssd_capacity_blocks = (
+                self.offload.partition_capacity_blocks
+            )
+        else:
+            self.offload = OffloadTier(config, self.block_bytes)
         self.ssd = self.offload
         if self.offload is not None:
             self.stats.record_offload_tier(self.offload.tier)
             self.stats.record_offload_profile(self._offload_profile())
+            if self._hbf_unlimited:
+                self.stats.hbf_capacity_reporting = 1
+                self.stats.hbf_capacity_configured_blocks = self.offload.capacity_blocks
         self._access_counter = 0
 
     def lookup(self, keys: list[PoolKey], *, now: float = 0.0) -> StoreHit:
@@ -94,10 +136,11 @@ class MooncakeStore:
         if hit_keys:
             # Per-object, not a global counter: the wasted-write classification
             # needs to know which objects were read, not how many reads ran.
-            for key in hit_keys:
-                obj = self.objects.get(key.to_string())
-                if obj is not None:
-                    obj.read_count += 1
+            if not self._credit_on_serve:
+                for key in hit_keys:
+                    obj = self.objects.get(key.to_string())
+                    if obj is not None:
+                        obj.read_count += 1
             self.stats.store_hit_count += 1
             if self._is_offload_tier(slowest_tier):
                 self.stats.disk_tier_hit_count += 1
@@ -142,11 +185,14 @@ class MooncakeStore:
             if obj is None:
                 continue
             self._touch(obj)
+            if self._credit_on_serve:
+                obj.read_count += 1
             if self._is_offload_tier(obj.tier) and self.offload is not None:
                 op = self.offload.read(obj.key)
-                self._record_offload_read(op)
+                self._record_offload_read(op, key=obj.key)
                 latency += op.latency
             else:
+                obj.pcm_served_reads += 1
                 latency += self._record_memory_read(obj)
         return latency
 
@@ -208,7 +254,13 @@ class MooncakeStore:
             segment=self.config.preferred_segment or "global",
             write_time=now,
         )
-        admitted, evict_timing = self._ensure_memory_capacity(obj.bytes, now=now)
+        if self._partitioned:
+            obj.rank = self._rank_of(key)
+            if self._per_rank:
+                self._key_rank[obj.key] = obj.rank
+        admitted, evict_timing = self._ensure_memory_capacity(
+            obj.bytes, now=now, rank=obj.rank
+        )
         if not admitted:
             if self.config.enable_offload and self.offload is not None:
                 obj.tier = self.offload.tier
@@ -225,6 +277,8 @@ class MooncakeStore:
                 self._record_offload_write(op, owner_key=obj.key)
                 self._drop_offload_victims(op, owner_key=obj.key)
                 self.objects[obj.key] = obj
+                if self._count_admit_source:
+                    self._seen_keys.add(obj.key)
                 self.stats.admission_count += 1
                 # Not a memory-tier admission: memory could not hold the block,
                 # so it goes straight to the offload tier under either write
@@ -236,6 +290,10 @@ class MooncakeStore:
         self.objects[obj.key] = obj
         self.memory_used_bytes += obj.bytes
         self.memory_lru[obj.key] = None
+        if self._partitioned:
+            self._admit_to_rank(obj)
+        if self._count_admit_source:
+            self._record_admit_source(obj)
         self.stats.admission_count += 1
         media_latency = self._record_memory_write(obj)
         timing = StoreWriteTiming(
@@ -264,6 +322,7 @@ class MooncakeStore:
         bytes_: int,
         *,
         now: float,
+        rank: int | None = None,
     ) -> tuple[bool, StoreWriteTiming]:
         """Free room for ``bytes_``, returning admission plus eviction cost.
 
@@ -272,20 +331,33 @@ class MooncakeStore:
         the ones that ran before an unsuccessful admission.
         """
         timing = StoreWriteTiming()
+        if self._per_rank:
+            return self._ensure_rank_capacity(bytes_, now=now, rank=rank)
         if bytes_ > self.memory_capacity_bytes:
             return False, timing
         while self.memory_used_bytes + bytes_ > self.memory_capacity_bytes:
             if self.config.eviction_policy != "lru" or not self.memory_lru:
                 return False, timing
-            timing += self._evict_memory_lru(now=now)
+            timing += self._evict_memory_lru(now=now, admitter=rank)
         return True, timing
 
-    def _evict_memory_lru(self, *, now: float) -> StoreWriteTiming:
-        key, _ = self.memory_lru.popitem(last=False)
+    def _evict_memory_lru(
+        self,
+        *,
+        now: float,
+        admitter: int | None = None,
+    ) -> StoreWriteTiming:
+        if self._per_rank:
+            key, _ = self._rank_lru[admitter].popitem(last=False)
+            self.memory_lru.pop(key, None)
+        else:
+            key, _ = self.memory_lru.popitem(last=False)
         obj = self.objects.get(key)
         if obj is None or obj.tier != "memory":
             return StoreWriteTiming()
         self.memory_used_bytes -= obj.bytes
+        if self._partitioned:
+            self._release_from_rank(obj, admitter)
         self.stats.memory_eviction_count += 1
         self.stats.record_memory_eviction(
             blocks=obj.blocks,
@@ -304,8 +376,13 @@ class MooncakeStore:
                     obj.tier = self.offload.tier
                 else:
                     self.objects.pop(key, None)
+                    self._record_departure(key, "if_read_drop")
                 return timing
             self.stats.blocks_demoted += obj.blocks
+            if self.config.count_if_read_gate and self.config.demote_policy == "if_read":
+                self.stats.if_read_gate_passes += obj.blocks
+                if obj.pcm_served_reads > 0:
+                    self.stats.if_read_gate_passes_pcm_served += obj.blocks
             obj.tier = self.offload.tier
             op = self.offload.write(obj.key, obj.blocks)
             write_timing = self._write_timing(
@@ -322,7 +399,26 @@ class MooncakeStore:
             # No offload tier to demote to; the victim leaves the store.
             self.stats.blocks_dropped += obj.blocks
             self.objects.pop(key, None)
+            self._record_departure(key, "other")
         return timing
+
+    def _record_departure(self, key: str, reason: str) -> None:
+        if self._count_admit_source:
+            self._departed[key] = reason
+
+    def _record_admit_source(self, obj: StoreObject) -> None:
+        """Classify a memory-tier admission by why its key was absent."""
+        if obj.key not in self._seen_keys:
+            self._seen_keys.add(obj.key)
+            self.stats.pcm_admit_first_blocks += obj.blocks
+            return
+        reason = self._departed.pop(obj.key, "other")
+        if reason == "if_read_drop":
+            self.stats.pcm_admit_after_if_read_drop_blocks += obj.blocks
+        elif reason == "hbf_evict":
+            self.stats.pcm_admit_after_hbf_evict_blocks += obj.blocks
+        else:
+            self.stats.pcm_admit_after_other_blocks += obj.blocks
 
     def _drops_on_eviction(self, obj: StoreObject) -> bool:
         """Whether ``demote_policy`` declines the demote write for ``obj``."""
@@ -333,6 +429,85 @@ class MooncakeStore:
         obj.last_access = self._access_counter
         if obj.tier == "memory" and obj.key in self.memory_lru:
             self.memory_lru.move_to_end(obj.key)
+            if self._per_rank:
+                self._rank_lru[obj.rank].move_to_end(obj.key)
+
+    # --- store_partition != "global" -------------------------------------
+
+    def _init_partitions(self) -> None:
+        self._rank_index: dict[tuple[int, int, int], int] = {}
+        self._rank_used_bytes: dict[int, int] = {}
+        self._rank_peak_bytes: dict[int, int] = {}
+        self._key_rank: dict[str, int] = {}
+        self.stats.partition_reporting = 1
+        if self._per_rank:
+            ranks = self.config.store_partition_ranks
+            if self.config.memory_capacity_blocks is not None:
+                rank_blocks = self.config.memory_capacity_blocks // ranks
+                self._rank_capacity_bytes = rank_blocks * self.block_bytes
+            else:
+                self._rank_capacity_bytes = self.config.global_segment_size // ranks
+                rank_blocks = self._rank_capacity_bytes // self.block_bytes
+            self._rank_lru: list[OrderedDict[str, None]] = [
+                OrderedDict() for _ in range(ranks)
+            ]
+            self.stats.partition_rank_memory_capacity_blocks = rank_blocks
+
+    def _rank_of(self, key: PoolKey) -> int:
+        md = key.key_metadata
+        identity = (md.tp_rank, md.pp_rank, md.dp_rank)
+        index = self._rank_index.get(identity)
+        if index is None:
+            index = len(self._rank_index)
+            if self._per_rank and index >= self.config.store_partition_ranks:
+                raise ConfigurationError(
+                    "store_partition='per_rank': saw more distinct ranks than "
+                    + f"store_partition_ranks={self.config.store_partition_ranks}"
+                )
+            self._rank_index[identity] = index
+            self._rank_used_bytes[index] = 0
+            self._rank_peak_bytes[index] = 0
+            self.stats.partition_ranks_seen = len(self._rank_index)
+        return index
+
+    def _ensure_rank_capacity(
+        self,
+        bytes_: int,
+        *,
+        now: float,
+        rank: int,
+    ) -> tuple[bool, StoreWriteTiming]:
+        timing = StoreWriteTiming()
+        if bytes_ > self._rank_capacity_bytes:
+            return False, timing
+        while self._rank_used_bytes[rank] + bytes_ > self._rank_capacity_bytes:
+            if self.config.eviction_policy != "lru" or not self._rank_lru[rank]:
+                return False, timing
+            timing += self._evict_memory_lru(now=now, admitter=rank)
+        return True, timing
+
+    def _admit_to_rank(self, obj: StoreObject) -> None:
+        rank = obj.rank
+        used = self._rank_used_bytes[rank] + obj.bytes
+        self._rank_used_bytes[rank] = used
+        if self._per_rank:
+            self._rank_lru[rank][obj.key] = None
+        if used > self._rank_peak_bytes[rank]:
+            self._rank_peak_bytes[rank] = used
+            peaks = [
+                self._rank_peak_bytes[index] // self.block_bytes
+                for index in range(len(self._rank_index))
+            ]
+            self.stats.partition_rank_peak_blocks = peaks
+            self.stats.partition_rank_peak_blocks_min = min(peaks)
+            self.stats.partition_rank_peak_blocks_max = max(peaks)
+
+    def _release_from_rank(self, obj: StoreObject, admitter: int | None) -> None:
+        self._rank_used_bytes[obj.rank] -= obj.bytes
+        if obj.rank == admitter:
+            self.stats.partition_evictions_same_rank += 1
+        else:
+            self.stats.partition_evictions_cross_rank += 1
 
     def _write_timing(
         self,
@@ -376,7 +551,11 @@ class MooncakeStore:
         directions). ``pcm`` charges a real media cost whose write side is
         deliberately far more expensive than its read side.
         """
-        if self.config.memory_media != "pcm" or bytes_ <= 0:
+        if (
+            self.config.memory_media != "pcm"
+            or bytes_ <= 0
+            or self.config.store_timing_mode == "free"
+        ):
             return 0.0
         if write:
             fixed_us = self.config.pcm_write_latency_us
@@ -386,13 +565,24 @@ class MooncakeStore:
             bandwidth = self.config.pcm_read_bw_gbps
         return fixed_us / 1e6 + bytes_ / _GB / max(1e-9, bandwidth)
 
-    def _record_offload_read(self, op) -> None:
+    def _record_offload_read(self, op, *, key: str | None = None) -> None:
         self.stats.ssd_read_blocks += op.blocks
         self.stats.ssd_read_bytes += op.bytes
+        if self._count_readback and op.blocks and self._hbf_unread.get(key):
+            self._hbf_unread[key] = False
+            self.stats.hbf_readback_read_blocks += op.blocks
 
     def _record_offload_write(self, op, *, owner_key: str | None = None) -> None:
         self.stats.ssd_write_blocks += op.blocks
         self.stats.ssd_write_bytes += op.bytes
+        if self._count_readback and op.blocks and owner_key is not None:
+            self._hbf_unread[owner_key] = True
+            self.stats.hbf_readback_written_blocks += op.blocks
+        if self._hbf_unlimited and op.blocks:
+            used = self.offload.used_blocks
+            if used > self.stats.hbf_capacity_peak_used_blocks:
+                self.stats.hbf_capacity_peak_used_blocks = used
+            self.stats.hbf_capacity_rank_peak_used_blocks_max = self.offload.peak_used_blocks
         # A refused write echoes the key back in evicted_keys; that is an
         # admission rejection for owner_key, not an eviction of it.
         self.stats.ssd_eviction_count += len(
@@ -423,12 +613,25 @@ class MooncakeStore:
             victim = self.objects.get(evicted_key)
             if victim is not None and self._is_offload_tier(victim.tier):
                 self.objects.pop(evicted_key, None)
+                self._record_departure(evicted_key, "hbf_evict")
 
     @staticmethod
     def _is_offload_tier(tier: str | None) -> bool:
         return tier == "ssd"
 
     def _offload_profile(self) -> dict[str, object]:
+        profile = self._stock_offload_profile()
+        # Recorded only off the stock value, so stock profiles are unchanged.
+        if self.config.store_timing_mode != "charged":
+            profile["store_timing_mode"] = self.config.store_timing_mode
+        if self._hbf_unlimited:
+            profile["hbf_capacity_mode"] = self.config.hbf_capacity_mode
+        if self._partitioned:
+            profile["store_partition"] = self.config.store_partition
+            profile["store_partition_ranks"] = self.config.store_partition_ranks
+        return profile
+
+    def _stock_offload_profile(self) -> dict[str, object]:
         return {
             "tier": self.offload.tier if self.offload is not None else None,
             "memory_capacity_blocks": self.config.memory_capacity_blocks,

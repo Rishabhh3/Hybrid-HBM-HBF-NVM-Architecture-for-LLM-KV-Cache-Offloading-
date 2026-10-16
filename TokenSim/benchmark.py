@@ -351,6 +351,35 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--arrival_jitter_ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Jitter half-width j in ms. 0 (default) leaves arrivals untouched. "
+            "See --arrival_jitter_mode for what is offset and on which clock."
+        ),
+    )
+    parser.add_argument(
+        "--arrival_jitter_mode",
+        choices=["request", "burst"],
+        default="request",
+        help=(
+            "request: each timestamped arrival gets its own uniform offset in "
+            "[-j, +j] ms on the trace clock, before timestamp scaling (a "
+            "workload variant: it permutes requests sharing a timestamp). "
+            "burst: every request sharing an arrival time gets the same offset "
+            "in [-j, +j] ms on the replay clock, after scaling, and the run "
+            "fails unless arrival order still equals file order. Only read "
+            "when --arrival_jitter_ms > 0."
+        ),
+    )
+    parser.add_argument(
+        "--jitter_seed",
+        type=int,
+        default=0,
+        help="Seed of the generator that draws --arrival_jitter_ms offsets.",
+    )
+    parser.add_argument(
         "--workload_type",
         choices=["synthetic", "json_pairs", "qwen_jsonl"],
         default="synthetic",

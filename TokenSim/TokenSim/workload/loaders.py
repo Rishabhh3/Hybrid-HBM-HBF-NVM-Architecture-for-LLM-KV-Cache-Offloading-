@@ -47,11 +47,28 @@ def load_workload(args: Any, model_config: PSLAConfig) -> UserRequestList:
     else:
         raise WorkloadValidationError(f"unknown workload_type {workload_type!r}")
 
-    return apply_trace_timestamp_scaling(
+    jitter_ms = getattr(args, "arrival_jitter_ms", 0.0)
+    jitter_seed = getattr(args, "jitter_seed", 0)
+    jitter_mode = getattr(args, "arrival_jitter_mode", "request")
+    if jitter_mode not in ARRIVAL_JITTER_MODES:
+        raise WorkloadValidationError(
+            f"unknown arrival_jitter_mode {jitter_mode!r}; expected one of "
+            + f"{sorted(ARRIVAL_JITTER_MODES)}"
+        )
+    if jitter_mode == "request":
+        user_requests = apply_arrival_jitter(
+            user_requests, jitter_ms=jitter_ms, jitter_seed=jitter_seed
+        )
+    user_requests = apply_trace_timestamp_scaling(
         user_requests,
         trace_timestamp_scale=getattr(args, "trace_timestamp_scale", None),
         trace_target_qps=getattr(args, "trace_target_qps", None),
     )
+    if jitter_mode == "burst":
+        user_requests = apply_burst_jitter(
+            user_requests, jitter_ms=jitter_ms, jitter_seed=jitter_seed
+        )
+    return user_requests
 
 
 def load_synthetic_workload(args: Any, model_config: PSLAConfig) -> UserRequestList:
@@ -242,6 +259,102 @@ def _validate_dataset_path(dataset_path: str) -> Path:
     if not path.exists() or not path.is_file():
         raise WorkloadValidationError(f"dataset file not found: {dataset_path}")
     return path
+
+
+ARRIVAL_JITTER_MODES = {"request", "burst"}
+
+
+def _validated_jitter_ms(jitter_ms: float) -> float:
+    jitter_ms = float(jitter_ms or 0.0)
+    if not math.isfinite(jitter_ms) or jitter_ms < 0:
+        raise WorkloadValidationError("arrival_jitter_ms must be finite and non-negative")
+    return jitter_ms
+
+
+def burst_gaps_s(user_requests: UserRequestList) -> list[float]:
+    """Gaps between consecutive distinct arrival times, in the list's clock.
+
+    A burst is the set of requests sharing one arrival time exactly.
+    """
+    times = sorted({r.arrival_time for r in user_requests if r.arrival_time is not None})
+    return [b - a for a, b in zip(times, times[1:])]
+
+
+def apply_burst_jitter(
+    user_requests: UserRequestList,
+    *,
+    jitter_ms: float = 0.0,
+    jitter_seed: int = 0,
+) -> UserRequestList:
+    """Offset each burst -- all requests sharing an arrival time -- by one draw.
+
+    Applied on the replay clock, after timestamp scaling. One uniform draw in
+    [-j, +j] ms per burst, from a private ``random.Random(jitter_seed)``, in
+    order of first appearance in the file; times below 0 are clamped to 0.
+    Requests within a burst keep identical times, so the stable arrival sort
+    keeps their file order. Afterwards the arrival order must equal file order
+    exactly, otherwise WorkloadValidationError: pick j below half the minimum
+    inter-burst gap (``burst_gaps_s``) and this cannot fire on a trace whose
+    file order is already time order. ``jitter_ms == 0`` returns the list
+    untouched and draws nothing.
+    """
+    jitter_ms = _validated_jitter_ms(jitter_ms)
+    if jitter_ms == 0.0:
+        return user_requests
+    rng = random.Random(jitter_seed)
+    jitter_s = jitter_ms / 1000.0
+    offsets: dict[float, float] = {}
+    for request in user_requests:
+        if request.arrival_time is None:
+            continue
+        if request.arrival_time not in offsets:
+            offsets[request.arrival_time] = rng.uniform(-jitter_s, jitter_s)
+    for request in user_requests:
+        if request.arrival_time is not None:
+            request.arrival_time = max(0.0, request.arrival_time + offsets[request.arrival_time])
+    timed = [r for r in user_requests if r.arrival_time is not None]
+    replay_order = sorted(range(len(timed)), key=lambda i: timed[i].arrival_time)
+    if replay_order != list(range(len(timed))):
+        raise WorkloadValidationError(
+            "burst jitter changed arrival order: arrival order no longer equals "
+            + f"file order (arrival_jitter_ms={jitter_ms}); reduce the jitter "
+            + "below half the minimum inter-burst gap"
+        )
+    return user_requests
+
+
+def apply_arrival_jitter(
+    user_requests: UserRequestList,
+    *,
+    jitter_ms: float = 0.0,
+    jitter_seed: int = 0,
+) -> UserRequestList:
+    """arrival_jitter_mode "request": offset each arrival by its own draw.
+
+    Uniform in [-j, +j] ms per timestamped request. A workload variant, not
+    noise: on traces whose timestamps are coarser than j it only permutes
+    requests that share a timestamp (PHASE 14 STEP 2b).
+
+    Applied on the trace clock, before trace_timestamp_scale/trace_target_qps,
+    so the simulated offset is j times the scaling factor. Offsets come from a
+    private ``random.Random(jitter_seed)`` -- never the global generators -- and
+    are drawn in request order, one per timestamped request; a jittered time
+    below 0 is clamped to 0. ``jitter_ms == 0``
+    (the default) returns the list untouched and draws nothing.
+    """
+    jitter_ms = _validated_jitter_ms(jitter_ms)
+    if jitter_ms == 0.0:
+        return user_requests
+    rng = random.Random(jitter_seed)
+    jitter_s = jitter_ms / 1000.0
+    for request in user_requests:
+        if request.arrival_time is not None:
+            # Clamped at 0 so a request at the trace origin cannot be moved
+            # before it; only arrivals within j of t = 0 are affected.
+            request.arrival_time = max(
+                0.0, request.arrival_time + rng.uniform(-jitter_s, jitter_s)
+            )
+    return user_requests
 
 
 def apply_trace_timestamp_scaling(
