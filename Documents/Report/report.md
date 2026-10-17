@@ -118,19 +118,30 @@ medium: `memory_media` changes timing only.
 **TokenSim does not support this part.** It rests on the durability argument
 and on capacity-per-area figures, not on byte counts.
 
-- **Durability.**
+- **Why not DRAM — primary argument: durability.**
   - Under write-back, an acknowledged block lives only in the staging tier
-    until it is demoted, so a volatile tier loses it on power loss.
+    until it is demoted.
+  - A volatile buffer cannot absorb writes in this role: acknowledged data
+    would be lost on power failure.
+  - This needs no density figure and no citation beyond write-back semantics.
   - TokenSim cannot measure durability.
   - **Caveat:** KV blocks can be recomputed. For a cache, losing them costs
     recomputation (time and energy), not correctness. The argument is weaker
     here than for primary storage, and the paper must say so.
-- **Why not DRAM.**
-  - 43.4 GiB/GPU of in-package buffer is a cost and area argument.
-  - PCM's capacity per area is sourced: 0.62 Gb/mm² (Ehrmann *et al.* 2022),
-    fitted on top of the HBF stacks without displacing NAND.
-  - **A comparable in-package DRAM density is OPEN.** Nothing in the tracked
-    files gives one, so no area comparison is made until it is sourced.
+- **Supporting evidence only: area and density.** Do not lead with this.
+  - PCM's capacity per area is sourced: 0.62 Gb/mm², 1st-gen XPoint, a planar
+    die figure (Ehrmann *et al.* 2022). The tier sits on top of the HBF stacks
+    without displacing NAND.
+  - **DRAM density: placeholder figures recorded, primary source pending.**
+    - HBM3 0.16 Gb/mm²; HBM3E ~0.20 Gb/mm².
+    - Industry newsletters, not peer-reviewed; **NEEDS PRIMARY SOURCE**. Not
+      citable.
+    - Full record: findings.md "DRAM DENSITY — PLACEHOLDER".
+  - On those placeholders, PCM is **~3–4× denser per die area** (3.1–3.9×).
+    That is an **upper bound**:
+    - the HBM figures include TSV overhead;
+    - 0.62 is a planar density with none;
+    - stacked PCM dies would need TSVs too.
 
 #### 3. MEASURED, non-trivial: (d) read-gated demotion — the contribution
 
@@ -144,7 +155,7 @@ j = 0.05 × gap, seeds 1–3.
 | …and keeps part of the reuse | (d) keeps **53.0–53.7% / 87.8–88.0%** of (b)'s reuse-hit blocks (hit rate 0.1006–0.1019 / 0.3959–0.3966 vs 0.1898 / 0.4510) | STEP 4 |
 | **…but most of that reuse needs no store** | **No store at all keeps 48.3% / 85.8%** (hit rate 0.0916 / 0.3870). (d) therefore keeps only **9.2–10.5% / 13.9–15.1%** of the store's reuse benefit. Its store-served tokens are 10.7–12.4% / 13.9–15.7% of (b)'s. Over no store, (d)'s hit rate is +9.8% to +11.2% / +2.3% to +2.5% | STEP 4; no-store control |
 | PCM is read: it serves (d)'s reuse | Share of store-served tokens from PCM: (b) 6.9% / 7.2%; (c) 6.3% / 6.6%; **(d) 72.6–76.5% / 71.3–73.9%**. Every (d) `if_read` pass is backed by a PCM-served read (difference 0, 8 runs) | STEP 4 |
-| PCM admissions by source | @@ADMIT@@ | HBF capacity check |
+| PCM admissions by source | (d), N = 4: first-time **89.54–89.67% / 90.23–90.29%**; re-admission after an `if_read` drop **10.33–10.46% / 9.71–9.77%**; after an HBF eviction 0; other 0. (b) and (c): first-time 99.91–99.98%, after an HBF eviction ≤ 0.09% | HBF capacity check; (d) counter reruns |
 | HBF bytes per reuse-hit block | (b) 21.3 M / 6.06 M; (c) 10.6 M / 3.01 M; (d) **193–217 k / 44–46 k** | STEP 4 |
 | PCM write traffic | PCM B/req: (b) 1.526 G / 0.737 G; (c) 1.527 G / 0.737 G; (d) 1.703–1.706 G / 0.815–0.816 G. PCM endurance is still OPEN | STEP 4 |
 | Lifetime ratio (b ÷ d) | **Only as a range:** ×182–×208 / ×150–×157. Quote the reductions and B/req instead | STEP 4 |
@@ -291,6 +302,7 @@ At W = 5,000, re-admissions are ~7.2–7.7% / 5.1–5.7% of (d)'s PCM writes.
 |---|---|
 | PCM endurance (P/E cycles) | **OPEN** — to be sourced |
 | HBF dies per stack | **OPEN** — not needed for capacity (384 GB/stack is sourced) |
+| In-package DRAM (HBM3 / HBM3E) density | **DRAM density: placeholder figures recorded, primary source pending.** HBM3 0.16, HBM3E ~0.20 Gb/mm². From industry newsletters; NEEDS PRIMARY SOURCE (an ISSCC/IEDM HBM3E paper with die photo and area from SK hynix, Samsung or Micron) |
 | CAG corpus size, requests sharing it, transient KV per request | **OPEN** |
 
 ---
@@ -768,6 +780,19 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
 ## Pending LaTeX sync
 
 > **One LaTeX rewrite, after STEP 4.** Every item below is listed, not applied.
+
+- [ ] **"Why not DRAM" (2026-10-17).**
+  - Lead with **durability**: under write-back, acknowledged data lives only
+    in the staging tier, so a volatile buffer would lose it on power failure.
+    Include the recomputable-KV caveat.
+  - Area/density is supporting evidence only.
+  - **Do not cite the HBM3/HBM3E newsletter figures.** They are placeholders
+    (NEEDS PRIMARY SOURCE).
+    - Until an ISSCC/IEDM HBM3E die-area paper is sourced, give no DRAM
+      density number in the paper. At most write "per-die density is higher
+      than HBM's, subject to TSV overhead".
+    - Never use the ~0.33 Gb/mm² TSV-penalised figure (author's
+      illustrative arithmetic).
 
 - [ ] **FRAMING (2026-10-17). This supersedes "(c) as the primary result" in
       the NEW HEADLINE item below.** Structure the abstract, contributions,

@@ -8356,3 +8356,135 @@ residue would go:
   with the extra PCM writes.
 - **If it were spilled and never demoted** (upper bound), every threshold rises
   by **+3.8% to +4.1%**.
+
+## (d) PCM admissions by source, N = 4 (counter reruns of the jittered STEP 4 runs)
+
+**This supersedes the N = 1 (d) row** in "HBF CAPACITY CHECK → What else the
+check shows", item 3. That row was the unjittered run only.
+
+**Runs.** `hc_f_d_j05_s{1,2,3}_{conv,ta}`: the STEP 4 jittered (d) runs
+(burst jitter j = 0.05 × min gap: 16.989 ms Conv, 33.338 ms T&A, seeds 1–3),
+with `count_pcm_admit_source` on. Script: `scripts/phase14/hbfcap_schedule.py
+jit`; table: `scripts/phase14/hbfcap_table.py WORK d`.
+
+- **Reproduction:** each run equals its STEP 4 run (`s4_d_j05_s{k}_*`) on
+  every key except the four `pcm_admit_*` keys. All 6 runs show "yes".
+- All 6 finished with rc 0. They took 6:48–7:43 each, with peak RSS
+  8.5–10.1 GiB.
+- Same traces (md5s as in STEP 4) and the same hardware json
+  (`9b4cba823dd4158d9bd3efe16bf74491`).
+- Code: the user's commit `d9bea39` plus the uncommitted working tree.
+
+
+### Conversation — (d) PCM admissions by source, N = 4
+
+| run | PCM admissions | first | after if_read drop | after HBF eviction | other | sum check | = s4 run on all other keys |
+|---|---|---|---|---|---|---|---|
+| unjittered | 7,828,755 | 7,009,652 (89.54%) | 819,103 (10.46%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s1 | 7,820,539 | 7,008,505 (89.62%) | 812,034 (10.38%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s2 | 7,814,771 | 7,007,673 (89.67%) | 807,098 (10.33%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s3 | 7,826,175 | 7,009,257 (89.56%) | 816,918 (10.44%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| **range (N = 4)** | | 89.54% – 89.67% | 10.33% – 10.46% | 0.00% – 0.00% | 0.00% – 0.00% | | |
+
+### Tool&Agent — (d) PCM admissions by source, N = 4
+
+| run | PCM admissions | first | after if_read drop | after HBF eviction | other | sum check | = s4 run on all other keys |
+|---|---|---|---|---|---|---|---|
+| unjittered | 7,349,273 | 6,630,899 (90.23%) | 718,374 (9.77%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s1 | 7,343,617 | 6,629,110 (90.27%) | 714,507 (9.73%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s2 | 7,341,820 | 6,629,137 (90.29%) | 712,683 (9.71%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| _j05_s3 | 7,345,008 | 6,631,493 (90.29%) | 713,515 (9.71%) | 0 (0.00%) | 0 (0.00%) | ok | yes |
+| **range (N = 4)** | | 90.23% – 90.29% | 9.71% – 9.77% | 0.00% – 0.00% | 0.00% – 0.00% | | |
+
+**Summary (N = 4):**
+
+| | first-time | after an `if_read` drop | after an HBF eviction | other |
+|---|---|---|---|---|
+| (d) Conv | **89.54–89.67%** | **10.33–10.46%** | 0 | 0 |
+| (d) T&A | **90.23–90.29%** | **9.71–9.77%** | 0 | 0 |
+
+- The spread across the 4 runs is ≤ 0.13 pt.
+- The four counters sum to `mooncake_memory_write_blocks` in every run.
+- Re-admitted blocks: 807,098–819,103 (Conv) and 712,683–718,374 (T&A).
+
+**What re-admission explains, in blocks.** This replaces a chat-only
+statement that it explained "most" of the gap; that statement compared
+percentages with different bases. (d) writes more PCM blocks than (c), and
+re-admissions after an `if_read` drop account for that difference almost
+exactly:
+
+| | (d) − (c) PCM write blocks | re-admissions after an `if_read` drop | share of the difference |
+|---|---|---|---|
+| Conv (N = 4) | 808,254 – 822,238 | 807,098 – 819,103 | **99.6–99.9%** |
+| T&A (N = 4) | 702,112 – 709,565 | 712,683 – 718,374 | **101.2–101.5%** |
+
+The small remainder is two effects:
+
+- First-time admissions differ by +2,660 to +4,639 (Conv) and −4,646 to
+  −2,263 (T&A) blocks, because the schedules differ slightly.
+- (c) re-admits 1,504 / 5,952 blocks after HBF evictions, which (d) does not.
+
+So (d)'s extra PCM write traffic over (c) is the cost of re-taking blocks it
+dropped.
+
+## DRAM DENSITY — PLACEHOLDER (2026-10-17). Not sourced, not citable
+
+This supports the "why not DRAM" area comparison only. **None of these
+figures is a sourced design parameter.** Do not cite them in LaTeX and do not
+use them in any other calculation.
+
+| figure | value | source quality |
+|---|---|---|
+| SK hynix HBM3 | 0.16 Gb/mm² | industry newsletter, not peer-reviewed. **NEEDS PRIMARY SOURCE** |
+| SK hynix D1z DDR4 | 0.296 Gb/mm² ("85% denser than their HBM3") | industry newsletter, not peer-reviewed. **NEEDS PRIMARY SOURCE** |
+| HBM3E | ~0.20 Gb/mm² (~200 Mb/mm²) | industry newsletter, not peer-reviewed. **NEEDS PRIMARY SOURCE** |
+| HBM3E die geometry | 11 mm × 11 mm, 3 GB (24 Gb) per die | industry newsletter, not peer-reviewed. **NEEDS PRIMARY SOURCE** |
+
+**Intended replacement:** an ISSCC or IEDM HBM3E paper with a die photo and
+die area, from SK hynix, Samsung or Micron.
+
+**Internal checks (they hold; they show consistency, not correctness):**
+
+- 24 Gb / (11 × 11 = 121 mm²) = **0.198 Gb/mm²**, matching the stated
+  ~200 Mb/mm².
+- 0.296 / 0.16 = 1.85, matching "85% denser".
+
+**Units are unknown.** The newsletters do not say whether Gb is decimal or
+binary. This project reads 0.62 Gb/mm² as binary (2³⁰ bits, CLAUDE.md
+units). A mismatch would shift the ratios below by ≤ 7.4%; this is not
+adjusted.
+
+**Comparison** against the sourced PCM figure: 0.62 Gb/mm², 1st-gen 3D
+XPoint (Ehrmann *et al.*, *Applied Research* 2022, e202200024):
+
+| | ratio |
+|---|---|
+| 0.62 / 0.16 (HBM3) | **3.9×** |
+| 0.62 / ~0.20 (HBM3E) | **3.1×** (3.1× against the 0.198 cross-check) |
+
+→ PCM is **~3–4× denser per die area. This is an UPPER BOUND, not the
+realised figure.**
+
+- The HBM figures are **after** TSV overhead.
+- 0.62 is a **planar** die density with no TSV overhead.
+- Our PCM dies sit in a stack and need TSVs too.
+
+**Scale of the TSV cost: illustrative only. AUTHOR'S OWN ARITHMETIC, derived,
+unsourced. Not a measured or cited value; do not propagate.**
+
+- DDR4 → HBM3 density falls 0.296 → 0.16, a **~46%** loss (1 − 0.16/0.296 =
+  0.459).
+- Applying the same factor to 0.62 gives 0.62 × 0.16/0.296 = **~0.335
+  Gb/mm²**. That is ~2.1× HBM3 and ~1.7× HBM3E (0.198).
+- That 46% is not purely TSV area. The two dies are different products,
+  probably on different process generations and with different interface
+  circuitry, and the newsletters do not separate those effects. So it
+  indicates the scale of a stacking penalty only loosely.
+
+**Framing (report.md):**
+
+- The primary "why not DRAM" argument is **durability**. Under write-back a
+  volatile buffer would lose acknowledged data on power failure. This needs no
+  density figure.
+- Area/density is supporting evidence only and is not the lead.
+- The recomputable-KV caveat on durability stands (report.md, part 2).
