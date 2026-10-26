@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PHASE 14: break-even PCM endurance, per TP shard, full traces, headline.
 
-    breakeven_pcm.py WORK
+    breakeven_pcm.py WORK [sweep]
 
 E_PCM = (HBF_cap_bytes x 3000 / HBF_B_per_req) x PCM_B_per_req / PCM_cap_bytes
 
@@ -69,5 +69,45 @@ def main(work):
               f"{lo / ec[0]:.2f} – {hi / ec[0]:.2f}; sanity check (E_d/E_c == HBF_c/HBF_d x PCM_d/PCM_c): holds in all 4 to 1e-12")
 
 
+def sweep(work):
+    """Requests to first wear-out vs assumed PCM endurance (pool basis: B/req is
+    pooled over all 4 ranks). A tier wears out at capacity x endurance / B_per_req;
+    the system at the first tier to do so. (b)'s buffer is DRAM and never wears
+    out, so (b) is HBF-limited at every endurance. Same assumptions as main()."""
+    hbf_pool, pcm_pool = RANKS * HBF_CAP, RANKS * PCM_CAP
+    sweep_e = (1e5, 2e5, 3e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12)
+    for tr in ("conv", "ta"):
+        rows = {}
+        for cfg, seeds in RUNS.items():
+            for s in seeds:
+                d = load(work, f"s4_{cfg}{s}_{tr}")
+                n = d["request_count"]
+                rows.setdefault(cfg, []).append((d["mooncake_ssd_write_bytes"] / n, d["mooncake_memory_write_bytes"] / n))
+
+        def life(cfg, hbf, pcm, e):
+            hbf_life = hbf_pool * PE_HBF / hbf
+            return hbf_life if cfg == "b" else min(hbf_life, pcm_pool * e / pcm)
+
+        (bh, _), = rows["b"]
+        (ch, cp), = rows["c"]
+        print(f"\n### {TRACE[tr]} — requests to first wear-out vs assumed PCM endurance\n")
+        print("| PCM endurance (cycles) | (b) | (c) | (d), N = 4 | (d) ÷ (c) | (d) ÷ (b) |")
+        print("|---|---|---|---|---|---|")
+        for e in sweep_e:
+            lb, lc = life("b", bh, 0, e), life("c", ch, cp, e)
+            ld = [life("d", h, p, e) for h, p in rows["d"]]
+            print(f"| {e:.0e} | {lb:.3g} | {lc:.3g} | {min(ld):.3g} – {max(ld):.3g} | "
+                  f"{min(ld) / lc:.2f} – {max(ld) / lc:.2f} | {min(ld) / lb:.2f} – {max(ld) / lb:.2f} |")
+        hb = lambda h: hbf_pool * PE_HBF / h
+        over_b = [hb(bh) * p / pcm_pool for _, p in rows["d"]]
+        over_c = [hb(ch) * p / pcm_pool for _, p in rows["d"]]
+        print(f"\n(d) outlives (b) when E_PCM > {min(over_b):,.0f} – {max(over_b):,.0f}; "
+              f"(d) outlives (c) when E_PCM > {min(over_c):,.0f} – {max(over_c):,.0f} "
+              f"(above (c)'s own break-even {hb(ch) * cp / pcm_pool:,.0f}, so (c) is HBF-limited there).")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if sys.argv[2:] == ["sweep"]:
+        sweep(sys.argv[1])
+    else:
+        main(sys.argv[1])

@@ -1,315 +1,615 @@
-# Running report — PCM write-absorbing tier for HBM + HBF KV cache
-
-**Working document.** Updated as work happens. The LaTeX paper
-(`../Latex/pcm-kv-micro.tex`) is synced from this **once a week** — see
-[Pending LaTeX sync](#pending-latex-sync) for what has not made it across yet.
+# Report — PCM write-absorbing tier for an HBM + HBF KV cache
 
 | | |
 |---|---|
-| Last updated | **2026-10-12** |
-| Simulator | `TokenSim/` — see `TokenSim/docs/findings.md` (append-only, the full record) |
-| Latest phase | **PHASE 14** (STEP 4 full traces; HBF capacity check) |
+| Last updated | **2026-10-22** |
+| Simulator | `TokenSim/` (SimPy LLM-serving simulator with a Mooncake KV store) |
+| Full record | `TokenSim/docs/findings.md` (append-only). If Part A and findings.md disagree, findings.md wins |
+| Latest phase | **PHASE 14** (full-trace headline, HBF capacity check, break-even PCM endurance) |
 | Tests | **277** passing |
-| Headline status | **HEADLINE = spill-only + vLLM-style lookup + honest read bookkeeping, 43.4 GiB/GPU per_rank, cap 48, FULL TRACES** (configuration decided 2026-10-12 on modelling grounds; window decided after STEP 4). **Contribution: (d) read-gated demotion** (drops 98.7–99.0% of (c)'s HBF writes, keeps 9–15% of the store's reuse benefit) **plus the argued case for a non-volatile in-package tier** (not simulator-supported). (c)'s ~49–50% is a write-policy identity that characterises the baseline. Scope: prompt blocks only |
+| Paper | `../Latex/pcm-kv-micro.tex`, synced from Part A (see [Pending LaTeX sync](#pending-latex-sync)) |
+
+**How this file is organised.**
+
+- **Part A** is the report: self-contained and current. It covers what was
+  built, how it was measured, what was found, what was corrected, and what is
+  not claimed.
+- **Part B** is the working record: the weekly log, superseded numbers and the
+  LaTeX sync list. It is kept unchanged for traceability.
+- Anything marked **OPEN** is an unsourced parameter. Anything marked
+  **ASSUMED** or **PLACEHOLDER** is used or recorded but not sourced.
 
 ---
 
-## How to use this file
+# Part A — the report
 
-- **Append to the weekly log**, newest first. One entry per working session is
-  fine; they get merged at sync time.
-- **Keep `findings.md` as the source of truth for numbers.** This file
-  summarises; it does not replace. If the two disagree, `findings.md` wins.
-- **Move things from [Pending LaTeX sync](#pending-latex-sync) into the paper
-  once a week**, then clear the entry here.
-- Anything marked **OPEN** is an unsourced parameter. Do not guess one to make a
-  run go through; record what was used and that it is unsourced.
+## A1. The question
 
----
+**H3** (SK hynix, IEEE CAL 2026) adds high-bandwidth flash (HBF, NAND) behind
+HBM.
 
-## Status at a glance
+- H3 targets **read-only** data: model weights and shared, precomputed KV.
+  For that data, NAND's low write endurance does not matter.
+- **We put the same hardware under a write-heavy serving workload.** Here KV
+  blocks evicted from HBM are spilled to HBF, so HBF receives a continuous
+  write stream and its endurance is at risk.
 
-### Decision record (2026-10-11) — read before the tables below
+We add a **bit-alterable non-volatile tier (PCM)** between HBM and HBF and ask
+**how much of the HBF write stream it can absorb, and at what cost in reuse.**
 
-- **Headline = design capacity + `per_rank`.** The decision was made on
-  hardware grounds, not on the control-run results.
-  - **Capacity.** 43.4 GiB/GPU is fixed by die area: 2 PCM dies per stack,
-    each the area of a 1 Tbit TLC die. So the pool sized for the 4 writing
-    ranks is the design point. 142,213 blocks becomes the **86.8 GiB/GPU
-    point**, i.e. 4 PCM dies per stack.
-  - **Partition.** PCM is in-package on each GPU's own HBF stacks, so the
-    pools are private: `per_rank` is faithful, and `global` is a variant.
-- **What it moves (from the controls).** (c) goes slightly **down**,
-  51.10 / 52.18% → ~50.8 / 51.0%. (d) goes **up**, 98.6–99.0% → ~99.7–99.8%.
-- **Unit check RESOLVED (2026-10-11): binary throughout.** The headline pool is
-  **71,104 = `per_rank` 4 × 17,776 = 43.4 GiB/GPU**. HBF stays 5,033,164. The
-  35 mm² die is kept, a < 1% rounding of 35.3 mm². 29 Gb/mm² (TLC) is still
-  uncited, so its unit stays OPEN.
-- **Density decision.** 1st-gen XPoint, 0.62 Gb/mm² (Ehrmann *et al.*,
-  *Applied Research* 2022, e202200024, via TechInsights) is the headline
-  density.
-  - 2nd-gen (4-deck) XPoint would roughly double it, which is approximately the
-    86.8 GiB/GPU point. That point is reported as such; there are no new runs.
-  - **Do not call 0.62 "conservative" overall:** it lowers (c)'s reduction
-    slightly but raises (d)'s.
-- **New reporting rule for (d).** Every (d) result also reports its hit rate vs
-  (b) at the same pool, and HBF bytes per reuse-hit block for (b), (c) and (d).
-  Under `if_read` a smaller PCM writes less to HBF partly by dropping reuse.
-  - At the design point that loss is small: Conv reuse-hit blocks −2.5%, T&A
-    none detectable.
-  - HBF bytes per reuse-hit block (d) at the design point: **126–139 k**
-    (Conv) / **19.1 k** (T&A).
-  - (b) at the design point: **25.4 M** / **7.4 M**.
+## A2. The architecture being modelled
 
-**The headline rows below are the design point** (71,104 blocks, per_rank,
-cap 48; PHASE 14 headline set). The 86.8 GiB/GPU point (142,213, global) is
-given alongside, labelled.
+### Per-GPU hardware
 
-### What is established
+| tier | capacity per GPU | source |
+|---|---|---|
+| HBM3e | 192 GB, 8 cubes × 24 GB, all KV (weights live in HBF) | H3 |
+| HBF (NAND, TLC) | 3 TB, 8 stacks × 384 GB, 3000 P/E | H3 (capacity); CLAUDE.md (P/E) |
+| PCM (our addition) | **43.4 GiB**: 2 dies/stack × 35 mm² × 0.62 Gb/mm² = 43.4 Gb = 5.43 GiB per stack, × 8 stacks | 0.62 Gb/mm²: 1st-gen 3D XPoint, Ehrmann *et al.*, *Applied Research* 2022 |
 
-**HEADLINE (2026-10-12): spill-only entry (HBM → PCM on eviction) +
-vLLM-style lookup (`after_hbm`) + honest read bookkeeping (`read_credit =
-served`, `load_span = missing`), on the FULL TRACES** (12,031 Conv / 23,608
-T&A requests, PHASE 14 STEP 4). Design capacity 43.4 GiB/GPU: PCM 71,104
-blocks as `per_rank` 4 × 17,776; HBF 5,033,164. Cap 48, 30 QPS. FP16; **B/req
-are per TP shard**; batch per active scheduler. Workload: Mooncake FAST'25
-traces, a stand-in for CAG. (d) is N = 4: the unjittered run plus burst
-jitter j = 0.05 × gap, seeds 1–3.
+- **Topology.** HBM and HBF are daisy-chained through a router in the HBM base
+  die; no HBM is given up for flash (H3).
+- **PCM placement.** PCM sits **on top of each HBF stack, inside the existing
+  footprint**, so it takes no NAND capacity.
+- **Units.** Binary throughout: Gb = 2³⁰ bits, GB read as GiB.
 
-**The configs, exactly.**
-- **(b) is not "HBF only".** It is a **71,104-block write-through DRAM buffer
-  in front of HBF** (`dram`, `write_through`, `always`). The buffer serves
-  **6.9% / 7.2%** of (b)'s store-served tokens.
-- (c) = PCM, write-back, `always`.
-- (d) = PCM, write-back, `if_read`.
+### Data path
 
-**Framing (decided 2026-10-17).**
+```
+HBM (KV cache) --evict--> PCM (staging tier) --demote--> HBF (flash)
+      ^                        |                            |
+      +-------- read (hit) ----+----------------------------+
+```
 
-- **(c) characterises the baseline; it is not a design contribution.** Its
-  halving is a write-policy identity.
-- **The contribution is (d)**, a measured selection policy, plus the
-  architectural case for a non-volatile in-package staging tier, which is
-  argued, not measured.
+- **A block enters the store only when HBM evicts it** (spill).
+- **On a later request, a block is read from PCM or HBF straight into HBM.**
+  An HBF hit is **not** re-admitted to PCM: `store.get` reads it in place
+  (`store.py:179-182`), and a later spill of the same key only refreshes it
+  (`store.py:234-237`).
+- **When PCM is full**, its LRU victim is either demoted to HBF or dropped,
+  depending on the configuration.
+
+### The three configurations
+
+| | staging tier | admission write | at staging-tier eviction | what it represents |
+|---|---|---|---|---|
+| **(b)** | 71,104-block **DRAM** buffer | **write-through**: the block also goes to HBF immediately | demote to HBF (`always`) | **the baseline**. Not "HBF only": the buffer serves 6.9% / 7.2% of (b)'s store-served tokens |
+| **(c)** | 71,104-block **PCM** | **write-back**: PCM only | demote to HBF (`always`) | removes the write-through copy |
+| **(d)** | 71,104-block **PCM** | **write-back** | demote **only if the block was served from PCM at least once** (`if_read`), otherwise drop | **read-gated demotion**: our policy |
+
+Every number below is quoted as **Conv / T&A**, i.e. Mooncake Conversation
+trace / Tool&Agent trace.
+
+## A3. How it is simulated
+
+### Simulator
+
+**TokenSim** is an event-driven (SimPy) LLM-serving simulator. Its **Mooncake
+store** has a memory tier and an offload tier, each with LRU eviction.
+
+| tier | role |
+|---|---|
+| HBM | the GPU prefix cache |
+| Mooncake memory tier | the staging tier (PCM, or DRAM in (b)) |
+| Mooncake offload tier | HBF |
+
+- Each tier is a **per-operation latency function**,
+  `latency = fixed_µs + bytes / bandwidth` (`mooncake/ssd.py`).
+- Bandwidth is not shared between operations, and there is no queueing model
+  for the far tier.
+- **Write volume is counted exactly, in blocks and bytes, per tier.**
+
+All PHASE 14 behaviour is added behind configuration flags whose default is the
+stock behaviour. With every flag at its default, output is byte-identical to
+the pre-PHASE-14 code (`ced3806`).
+
+### Model and block size
+
+| quantity | value | source |
+|---|---|---|
+| model | LLaMa2-70B-GQA: Nhead 64, KV heads 64/8 = **8**, Nlayer 80, Dmodel 8192, head dim 128 | `hardware_models_h3b200.json:566-572` |
+| precision | **FP16, hardcoded** (2 bytes per value) | `cache_config.py:46-52` |
+| parallelism | TP2 / PP1 / DP4 on 8 GPUs. TP2 splits KV heads: **4 per shard** | `cache_config.py:173-178` |
+| KV bytes per token, per TP shard | 4 heads × 128 × 2 (K,V) × 2 B × 80 layers = **163,840 B** | `cache_config.py:46-52` |
+| tokens per block | 16 | `--block_size 16` |
+| **bytes per block** | 16 × 163,840 = **2,621,440 B** | `mooncake_store.py:41-43`. Measured: bytes ÷ blocks = 2,621,440 in every run |
+
+**Cross-check.** 43.4 GiB per GPU ÷ 2,621,440 B = 17,776.64 blocks, floored to
+**17,776**. So the configured PCM is 17,776 × 2,621,440 B = 43.398 GiB per GPU,
+agreeing with the design to within the floor (+0.0036%).
+
+**FP16 is a limitation.** FP8 would halve every byte count and double every
+tier's capacity in blocks.
+
+### Capacity bookkeeping: writing ranks and private pools
+
+- **Only 4 of the 8 GPUs write to the store.** Only the TP-0 worker of each
+  data-parallel group is scheduled (`llm_engine.py:577-579`). The TP-1 shard's
+  stream is an exact mirror and is not simulated.
+- **Every byte figure is therefore per TP shard** (one of 2). Ratios and
+  reductions are unaffected.
+- **Batch is quoted per active scheduler** = `batch_mean_cluster` ÷ 4.
+- **Pools are sized for the 4 writing GPUs and split into 4 private
+  partitions** (`store_partition = per_rank`). PCM is in-package on each GPU's
+  own HBF stacks, so one GPU cannot evict another's blocks.
+
+| tier | pool knob | split in code | per writing GPU | recorded in every result |
+|---|---|---|---|---|
+| PCM | `memory_capacity_blocks = 71,104` | `71,104 // 4` (`store.py:446`) | **17,776 blocks = 43.4 GiB** | `partition_rank_memory_capacity_blocks = 17,776` |
+| HBF | `ssd_capacity_blocks = 5,033,164` | `5,033,164 // 4` (`ssd.py:157-158`) | **1,258,291 blocks = 3 TiB** (3,298,534,359,040 B) | `partition_rank_ssd_capacity_blocks = 1,258,291` |
+| HBM | from the hardware entry's `Capacity` | per GPU | **78,643 blocks = 192 GiB** | — |
+
+**24 TiB, 12 TiB and 3 TiB are all correct; they measure different things.**
+
+- 24 TiB is the HBF of all 8 GPUs.
+- 12 TiB is the HBF of the 4 writing GPUs, which receives the counted bytes.
+- 3 TiB is one writing GPU's partition.
+
+**HBM `Capacity` is pre-compensated by +60.38 GiB.** TokenSim subtracts the
+model weights from HBM, but H3 keeps the weights in HBF. This is a workaround,
+not a model change.
+
+### The headline configuration, and why it was chosen
+
+```
+memory_capacity_blocks = 71104     ssd_capacity_blocks   = 5033164
+store_partition        = per_rank  store_partition_ranks = 4
+hbm_evict_save_policy  = spill_only    # a block enters PCM only when HBM evicts it
+store_lookup_start     = after_hbm     # look up only the blocks HBM did not hit
+read_credit            = served        # if_read credits a block only when PCM actually served it
+load_span              = missing       # load only the span HBM did not hit
+cap 48 concurrent requests per scheduler; 30 QPS; full traces
+```
+
+**Capacity and partition were chosen on hardware grounds** (A2, above).
+
+**Entry, lookup and bookkeeping were chosen on modelling grounds.** This is the
+only combination in which the store behaves as the intended hierarchy and PCM
+serves real reads. Each alternative fails in a specific, measured way:
+
+| alternative | what goes wrong | where |
+|---|---|---|
+| copy every prompt block into the store at admission (`prefill`, stock) | HBM and the store become parallel copies, not a hierarchy. PCM never serves a read (0 PCM-served tokens in 332 runs) | PHASE 12; PHASE 14 set A |
+| spill-only, but the lookup starts at block 0 (`zero`, stock) | the head of the prompt stays in HBM, so the walk stops at the first absent key. The store serves 0 / 769 of 5,000 lookups | PHASE 14 STEP 3b |
+| `read_credit = walked` (stock) | `if_read` credited every key the lookup *walked*, including blocks actually served from HBM. That opened the gate with no PCM read | PHASE 14 set A; V1 |
+| `load_span = from_start` (stock) | the load plan read the prompt head, not the span HBM missed (`mooncake_store.py:543`) | PHASE 14 set B |
+
+`after_hbm` follows the vLLM KV-connector contract:
+`get_num_new_matched_tokens(request, num_computed_tokens)` asks the external
+store only for tokens beyond the local hit. We cite the interface only.
+
+### Timing knobs (all runs)
+
+| knob | value | status |
+|---|---|---|
+| HBF read | 0.1 µs, 7451 GiB/s (= 8 TB/s) | 8 TB/s from H3. 0.1 µs is a **perfect-prefetch upper bound** for H3's latency-hiding buffer. This flatters (b) |
+| **HBF write** | **200 µs, 3.0 GiB/s** | **TokenSim's stock SSD default, unsourced.** These are the values every run used |
+| PCM read / write | 0.1 / 1.0 µs, 100 / 20 GiB/s | **ASSUMED** (TokenSim defaults for the PCM media model) |
+| `charge_eviction_writes` | true | demote writes are charged to the put that caused them |
+
+- **Byte counts are the results; timing only shapes the schedule.**
+  PHASE 14 STEP 2 removed all store time, or scaled the PCM write timing 0.25×
+  and 4×. Neither (b)'s HBF stream nor any PCM stream moved by more than 0.54%.
+- That test ran under the earlier copy-at-admission model and has **not been
+  repeated under the headline**.
+
+### Workload and replay
+
+- **Traces.** Mooncake FAST'25 Conversation (**12,031 requests**) and
+  Tool&Agent (**23,608**), replayed in full at **30 QPS**
+  (`--trace_target_qps 30`).
+- **They stand in for CAG** (cache-augmented generation), the H3 target
+  workload. CAG's corpus size, sharing factor and transient KV are OPEN.
+- **Prompt blocks only.** The store holds prompt KV. Generated KV has no key
+  and never enters it. Generated tokens are **2.58% / 1.94%** of all tokens,
+  which bounds what this omission can change on these traces.
+- **Hit rates are floors.** The traces hash prompts in 512-token chunks, while
+  the simulator uses 16-token blocks. A continuation therefore cannot reuse its
+  predecessor's partial tail (PHASE 13).
+- **Trace timestamps are whole seconds**, clustered into bursts. Order within
+  a burst is file order.
+
+### Replicates
+
+- **(b) and (c) are single runs.** Their HBF streams vary by ≤ 0.5% under
+  perturbation, measured in STEP 2b and the STEP 3 prelude.
+- **(d) is N = 4 per trace**: the unjittered run, plus 3 runs with
+  **burst-level arrival jitter**, seeds 1–3.
+  - Each burst is shifted by a random offset of up to j = 0.05 × the minimum
+    inter-burst gap: **16.989 ms (Conv) and 33.338 ms (T&A)**.
+  - The run fails unless arrival order still equals file order.
+  - Every (d) figure is a range over the 4 runs, never a midpoint.
+- **`--random_seed` is inert** on these traces: seeds 0/1/2 are byte-identical
+  (PHASE 14 STEP 2b). That is why jitter is used to make replicates.
+
+### Metrics
+
+| metric | definition |
+|---|---|
+| **HBF B/req** | bytes written to HBF ÷ requests, **per TP shard**. The primary write metric; it is work-normalised |
+| reduction (x)→(y) | 1 − B/req(y) ÷ B/req(x) |
+| residue-adjusted reduction | adds to HBF bytes the **end-of-run residue**: keyed blocks still in HBM at the end that were never spilled, assumed eventually demoted. Bounds the end-of-window bias |
+| hit rate | prefix-cache hit rate (HBM + store) |
+| **no-store control / store benefit kept** | the same run with the store disabled. Benefit kept = (hit − hit_no-store) ÷ (hit_(b) − hit_no-store) |
+| PCM-served share | store-served tokens served from PCM ÷ all store-served tokens |
+| HBF bytes per reuse-hit block | HBF bytes ÷ blocks hit on reuse (write cost per unit of reuse) |
+| HBF read-back share | HBF-written blocks read back from HBF before the trace ends |
+| **PCM admissions by source** | every PCM write tagged as first-time, after an `if_read` drop, or after an HBF eviction (`count_pcm_admit_source`) |
+| `if_read` gate check | demotions whose block had ≥ 1 real PCM-served read. Must equal all (d) demotions |
+| **break-even PCM endurance** | see A4, result 4 |
+
+### Verification gates (every campaign)
+
+1. **Reproduction gate.** A new campaign must first reproduce the PHASE 9
+   cap-48 table to every digit (Part B).
+2. **Byte identity.** With every new flag at its default, results are
+   identical to `ced3806` after stripping wall time and pool-key samples.
+3. **Counters are neutral.** Turning an instrumentation counter on changes no
+   other key.
+4. **Write identities.** In every (b)/(c) run, (b) HBF = admissions +
+   demotions and (c) HBF = demotions, both exact.
+5. **Pre-registered rules.** Expectations are written before the runs, and a
+   failed rule is reported as failed.
+
+## A4. Results (full traces, headline configuration)
+
+The claim has three parts, kept separate on purpose.
+
+| | part | nature |
+|---|---|---|
+| 1 | removing write-through halves HBF writes | **measured**, but an **identity**: a structural cost of the baseline |
+| 2 | why the staging tier should be non-volatile and in-package | **argued, not measured** |
+| 3 | read-gated demotion (d) | **measured, non-trivial**. The contribution |
 
 > **A same-capacity volatile buffer would write identical HBF bytes.** The case
 > for PCM rests on durability and in-package density, not on write volume.
 
-#### 1. MEASURED, an identity: the baseline's structural write cost
+### Result 1 — MEASURED, an identity: the baseline's structural write cost
 
 We quantify a structural cost in the baseline and confirm that it does not
-depend on HBF capacity. Write-through costs exactly one extra HBF write per
-admitted block. In every (b)/(c) run:
+depend on HBF capacity.
 
-- (b) HBF writes = PCM admissions + demotions;
-- (c) HBF writes = demotions.
+- **Write-through costs exactly one extra HBF write per admitted block.** In
+  every (b)/(c) run, (b) HBF writes = PCM admissions + demotions, and (c) HBF
+  writes = demotions.
+- So removing the write-through copy halves HBF writes **whatever the
+  medium**: `memory_media` changes timing only.
 
-Removing the write-through copy therefore halves HBF writes, whatever the
-medium: `memory_media` changes timing only.
-
-| | numbers (conv / T&A) | where |
-|---|---|---|
-| (b)→(c), 8 (b)/(c) runs (finite + unlimited HBF) | raw **50.22–50.25%**; residue-adjusted **49.26–49.29%**. Finite vs unlimited HBF: **≤ 0.01 pt** | STEP 4; HBF capacity check |
-| HBF B/req (b) → (c) | 3,036,078,553 → 1,511,160,257 / 1,466,116,938 → 729,379,925 | STEP 4 |
-| Hit rate (c) vs (b) | 0.1898 vs 0.1898 / 0.4511 vs 0.4510; keeps **~100%** of the store's reuse benefit | STEP 4 |
-| HBF evictions (finite HBF) | 1.97 M / 1.60 M ((b)), 1.90 M / 1.54 M ((c)). **Immaterial:** removing them moves HBF bytes by **≤ 0.09%** and hit rate by **≤ +0.11%**. Unlimited HBF peaks at 1.39× / 1.32× the pool (the distinct-key footprint) | HBF capacity check |
-
-#### 2. ARGUED, NOT MEASURED: why the staging tier should be non-volatile and in-package
-
-**TokenSim does not support this part.** It rests on the durability argument
-and on capacity-per-area figures, not on byte counts.
-
-- **Why not DRAM — primary argument: durability.**
-  - Under write-back, an acknowledged block lives only in the staging tier
-    until it is demoted.
-  - A volatile buffer cannot absorb writes in this role: acknowledged data
-    would be lost on power failure.
-  - This needs no density figure and no citation beyond write-back semantics.
-  - TokenSim cannot measure durability.
-  - **Caveat:** KV blocks can be recomputed. For a cache, losing them costs
-    recomputation (time and energy), not correctness. The argument is weaker
-    here than for primary storage, and the paper must say so.
-- **Supporting evidence only: area and density.** Do not lead with this.
-  - PCM's capacity per area is sourced: 0.62 Gb/mm², 1st-gen XPoint, a planar
-    die figure (Ehrmann *et al.* 2022). The tier sits on top of the HBF stacks
-    without displacing NAND.
-  - **DRAM density: placeholder figures recorded, primary source pending.**
-    - HBM3 0.16 Gb/mm²; HBM3E ~0.20 Gb/mm².
-    - Industry newsletters, not peer-reviewed; **NEEDS PRIMARY SOURCE**. Not
-      citable.
-    - Full record: findings.md "DRAM DENSITY — PLACEHOLDER".
-  - On those placeholders, PCM is **~3–4× denser per die area** (3.1–3.9×).
-    That is an **upper bound**:
-    - the HBM figures include TSV overhead;
-    - 0.62 is a planar density with none;
-    - stacked PCM dies would need TSVs too.
-
-#### 3. MEASURED, non-trivial: (d) read-gated demotion — the contribution
-
-(d) is a **selection policy, not an identity**. It demotes only blocks that
-were served from PCM. N = 4 per trace: the unjittered run plus burst jitter
-j = 0.05 × gap, seeds 1–3.
-
-| claim | numbers (conv / T&A) | where |
-|---|---|---|
-| (d) drops almost all of what (c) writes | (d) writes **0.97–1.10% / 1.28–1.34%** of (c)'s HBF bytes, i.e. drops **98.7–99.0%**. Against (b): worst-case reduction **99.45% / 99.33%**. (d) HBF B/req **14.6–16.6 M / 9.3–9.8 M** | STEP 4 |
-| …and keeps part of the reuse | (d) keeps **53.0–53.7% / 87.8–88.0%** of (b)'s reuse-hit blocks (hit rate 0.1006–0.1019 / 0.3959–0.3966 vs 0.1898 / 0.4510) | STEP 4 |
-| **…but most of that reuse needs no store** | **No store at all keeps 48.3% / 85.8%** (hit rate 0.0916 / 0.3870). (d) therefore keeps only **9.2–10.5% / 13.9–15.1%** of the store's reuse benefit. Its store-served tokens are 10.7–12.4% / 13.9–15.7% of (b)'s. Over no store, (d)'s hit rate is +9.8% to +11.2% / +2.3% to +2.5% | STEP 4; no-store control |
-| PCM is read: it serves (d)'s reuse | Share of store-served tokens from PCM: (b) 6.9% / 7.2%; (c) 6.3% / 6.6%; **(d) 72.6–76.5% / 71.3–73.9%**. Every (d) `if_read` pass is backed by a PCM-served read (difference 0, 8 runs) | STEP 4 |
-| PCM admissions by source | (d), N = 4: first-time **89.54–89.67% / 90.23–90.29%**; re-admission after an `if_read` drop **10.33–10.46% / 9.71–9.77%**; after an HBF eviction 0; other 0. (b) and (c): first-time 99.91–99.98%, after an HBF eviction ≤ 0.09% | HBF capacity check; (d) counter reruns |
-| HBF bytes per reuse-hit block | (b) 21.3 M / 6.06 M; (c) 10.6 M / 3.01 M; (d) **193–217 k / 44–46 k** | STEP 4 |
-| PCM write traffic | PCM B/req: (b) 1.526 G / 0.737 G; (c) 1.527 G / 0.737 G; (d) 1.703–1.706 G / 0.815–0.816 G. PCM endurance is still OPEN | STEP 4 |
-| Lifetime ratio (b ÷ d) | **Only as a range:** ×182–×208 / ×150–×157. Quote the reductions and B/req instead | STEP 4 |
-
-#### Measurement conditions (all configs)
-
-| | numbers (conv / T&A) | where |
-|---|---|---|
-| End-of-run HBM residue (bias) | **3.70–3.82% / 3.87–3.97%** of would-be store admissions (8.2–8.4% / 16.7–17.0% at W = 5,000). It fell roughly in proportion to request count, as pre-registered. Undercounts absolute B/req in every config | STEP 4 |
-| HBF read-back share (end-of-trace cut only) | (b) 4.61% / 4.18%; (c) 9.24% / 8.56%; (d) 23.7–25.5% / 22.3–25.7% | STEP 4 |
-| HBF fills in (b)/(c) | (d) never evicts. At W = 5,000 nothing evicts | STEP 4 |
-| Batch | Per active scheduler: (b) 47.09 / 45.63; (c) +0.03% / −0.40% vs (b); (d) −0.59% to −0.66% / −1.86% to −2.06% vs (b) | STEP 4 |
-
-**Earlier reference: W = 5,000** (same configuration, first 5,000 requests;
-the headline window until 2026-10-12). Compare with the rows above by metric,
-not by digit: the replay pace and the jitter values differ. (d) here is
-pooled over N = 16.
-
-| claim | numbers (conv / T&A) | where |
-|---|---|---|
-| **(c) halves flash writes, at no hit-rate cost — in every model tested** | raw **50.53% / 51.31%** (headline), residue-adjusted 48.38% (conv). HBF B/req (b) → (c): 3,224,847,254 → **1,595,182,416** / 1,471,166,808 → **716,365,103**. Hit rate (c) vs (b): 0.1645 vs 0.1646 / 0.4028 vs 0.4013. Keeps **~100%** of the store's reuse benefit (99.9% / 104.3% measured; T&A's > 100% is noise or scheduling feedback, not an improvement). Other models: copy-at-admission 50.81 / 50.99%; 86.8 GiB/GPU point 51.10 / 52.18% | PHASE 14 V2; no-store control |
-| (d) read-gated demotion removes almost all flash writes | **Pooled over N = 16 per trace** (stock + burst jitter, j = 0.005 / 0.05 / 0.45 × gap): **worst-case reduction 99.36% / 99.12%** (best 99.54% / 99.66%). (d) HBF B/req **14.8–20.7 M / 4.9–12.9 M** | PHASE 14 V2 |
-| …at a hit-rate cost | (d) hit rate **0.1003–0.1028 / 0.3704–0.3741**, against (b) 0.1646 / 0.4013: **−37.5% to −39.1% / −6.8% to −7.7%**. (d) keeps only **15.4–18.8% / 9.8–20.6%** of the store's reuse benefit (no-store hit rate 0.0885 / 0.3670) | PHASE 14 V2; no-store control |
-| PCM is read: it serves (d)'s reuse | Share of store-served tokens from PCM: (b) 11.0% / 19.9%; (c) 8.2% / 18.9%; **(d) 78.9–92.3% / 80.2–95.2%**. Every (d) `if_read` pass is backed by a PCM-served read (check: difference 0, 32 runs) | PHASE 14 V2 |
-| HBF bytes per reuse-hit block | (b) 24.0 M / 6.30 M; (c) 11.9 M / 3.06 M; (d) **179–247 k / 23–60 k** | PHASE 14 V2 |
-| PCM write traffic | PCM B/req: (b) 1.631 G / 0.754 G; (c) 1.632 G / 0.754 G; (d) 1.759–1.768 G / 0.794–0.799 G. PCM endurance is still OPEN | PHASE 14 V2 |
-| Lifetime ratio (b ÷ d) | **Only as a range:** ×155.6–×217.9 / ×114.0–×297.9. Quote the reductions and B/req instead | PHASE 14 V2 |
-| **End-of-run HBM residue** (bias) | Keyed blocks still in HBM, never spilled: **8.2–8.4% / 16.7–17.0%** of would-be store admissions. **Direction:** undercounts absolute B/req in every config. Understates (d)'s reduction. For (c) it depends on where those blocks would land: if they would eventually be demoted to HBF, raw (b)→(c) overstates by up to ~2 points (48.38% / 46.49% residue-adjusted); if they would stay in PCM within the window, raw understates. STEP 4 (full traces) shrinks the end effect | PHASE 14 STEP 3b, V2 |
-| Batch | Per active scheduler: (b) 46.33 / 45.78; (c) −0.41% / −0.68% vs (b); (d) −2.31% to −3.28% / −2.56% to −3.51% vs (b) | PHASE 14 V2 |
-
-**Read path (code):** HBF → HBM directly; an HBF-served block is **not**
-re-admitted to PCM in any config (`store.py:161-186`, `:234-237`). PCM is
-written only for keys absent from the store: first spills, (d)'s re-spills
-after an `if_read` drop, and (on full traces) re-spills after an HBF eviction.
-At W = 5,000, re-admissions are ~7.2–7.7% / 5.1–5.7% of (d)'s PCM writes.
-
-**Variants (labelled, not the headline):**
-
-| variant | numbers (conv / T&A) | where |
-|---|---|---|
-| Copy-at-admission, from-zero lookup (the old headline): (b)/(c) | (b)→(c) 50.81% / 50.99% | PHASE 14 headline set |
-| Copy-at-admission (d) | **Equivalent to "no store"**: with honest bookkeeping, 0 HBF writes and 0 store-served tokens (V1). Its old 99.6%+ reduction was a lookup-walk artefact | PHASE 14 V1, set A |
-| Spill + from-zero lookup | Degenerate: the store serves 0 / 769 of 5,000 lookups | PHASE 14 STEP 3b |
-| 86.8 GiB/GPU point (142,213 blocks, global) | (b)→(c) 51.10% / 52.18% (≈ 2nd-gen XPoint density) | PHASE 9 STEP 3 |
-| Wear vs concurrency, (b) and (c) | 0.50% / 1.10% spread over a 12× batch range (copy-at-admission, 86.8 GiB/GPU point) | PHASE 9 STEP 4 |
-| PCM capacity buys writes, not hit rate | hit rate flat over a 150× capacity sweep (copy-at-admission, global); knee ~38× the design point | PHASE 10; PHASE 14 STEP 3a audit |
-| HBM eviction does not drive far-tier writes under copy-at-admission | +0.00% / −0.07% (5% rule) | PHASE 12 |
-
-### What is not established
-
-- **VERIFIED (V1/V2, honest bookkeeping: `read_credit = served`,
-  `load_span = missing`).**
-  - **V1, copy-at-admission:** (d) HBF = **0** in all 8 runs, with 0 gate
-    passes and 0 store-served tokens. The headline (d) range was entirely the
-    lookup-walk artefact.
-  - **V2, spill + vLLM-style lookup:** every gate pass has a real PCM-served
-    read (difference 0 in all 32 runs). Reductions: (b)→(c) **50.53% /
-    51.31%**; (b)→(d) worst case **99.36% / 99.12%**.
-  - V2 detail: (d) HBF B/req 14.8–20.7 M / 4.9–12.9 M. (d) hit rate vs (b)
-    **−37.5% to −39.1% / −6.8% to −7.7%**. PCM serves 79–95% of (d)'s
-    store-served tokens.
-- **(c) is the claim that holds in every model tested.** Write-back admission
-  halves the flash write stream: **50.81% / 50.99%** in the headline (and
-  identically under the vLLM-style lookup), **50.53% / 51.31%** under spill +
-  vLLM-style lookup. (c) has no read dependence.
-- **RETRACTED as a mechanism:** "one read in PCM passes `if_read`". No
-  PCM-served reads occurred under copy-at-admission; the gate was opened by
-  lookup bookkeeping (`store.py:125`). The read-back numbers stand only as
-  measurements of blocks credited by the lookup walk.
-- **QUALIFIED:** every (d) HBF variability analysis characterises the
-  bookkeeping artefact, not the design. That covers STEP 2 timing arms, 2b
-  replicates, the j-size study, the concurrency sweep, the pooled bound and the
-  discrete-outcome pattern.
-
-- **CORRECTION (PHASE 14, set A): under copy-at-admission, PCM never serves a
-  read.** `memory_hit_tokens = 0` in all 332 such runs. (d)'s `if_read` gate
-  has been opened by **lookup touches**, not reads:
-  - `store.py:125` credits every hit key, including HBM-resident heads.
-  - `memory_read_blocks = 0` in the headline (d) runs, yet 7.8k–80k blocks were
-    demoted.
-  - **Set A fails rule A2:** under the vLLM-style lookup, headline (d) writes
-    **0** bytes to HBF in every run. (b) and (c) are unchanged.
-  - So the headline (d) HBF range (5.95–11.70 M / 4.08–6.35 M) is a
-    lookup-accounting artefact. (d) is in effect "drop every PCM victim". Its
-    real cost is the full hit-rate loss (−44% / −10% vs (b)).
-  - **The headline tables are not rewritten here.** Which lookup the headline
-    uses is a decision pending.
-
-- **CONSTRAINT (PHASE 14 STEP 3a): only TP-rank-0 workers are scheduled**
-  (`llm_engine.py:577-579`), so only 4 of 8 ranks ever write to the store.
-  - **Every "batch/sched" figure is half the active-scheduler batch.** Cap 48
-    is really ~45–46 per active scheduler, not ~23. Gaps between arms are
-    unaffected.
-  - **The PCM pool (142,213 blocks, sized for 8 GPUs) receives only TP-0
-    shards.** Its capacity relative to its write stream is **2× the design**,
-    and absolute bytes are one TP shard's worth.
-  - Undecided; no number has been re-interpreted yet.
-
-- **The store holds prompt blocks only.** Generated/transient KV has no key
-  space and never enters it. Defensible claim is the narrower one: *PCM as a
-  write-back buffer in front of HBF reduces **prefix-cache offload** writes by
-  51% (`always`) or 99% (`if_read`).*
-- **Ceiling on closing that gap, on these traces:** generated tokens are
-  **2.58%** / **1.94%** of all tokens (**4.0%** / **4.1%** against the
-  deduplicated write population). Prompt-heavy traces; a long-generation
-  workload would move this.
-- **Workload is a stand-in.** Target is CAG; Mooncake FAST'25 traces substitute.
-- **FP16 is hardcoded** in the harness. FP8 would halve KV bytes/token and
-  improve every write-volume number — so FP16 understates the benefit.
-- **(d)'s HBF write volume is perturbation-sensitive (PHASE 14 STEP 2).**
-  Removing all store time, or scaling the assumed PCM write timing 0.25×/4×,
-  moves it by **−10.9% to +57.0%**, non-monotonically. The (b) stream (≤ 0.18%)
-  and every PCM stream (≤ 0.54%) do not move. The (b)→(d) *reduction* stays at
-  98.41–98.99%.
-- **(d)'s HBF write volume has a large run-to-run spread (PHASE 14 STEP 2b).**
-  Over 5 clean replicates (burst-level jitter, arrival order unchanged) the
-  spread is **26% / 30%** of the mean at cap 48 (conv / T&A) at j = 0.45 × gap
-  and 16% / 19% at cap 256. **The spread depends on j:** at j = 0.05 × gap it is
-  8.6% / 14.1%, still above 5%. Every (d) range must state its j. The T&A
-  ratio of 0.47 is borderline against the 0.5 cut-off. The stock T&A
-  (d) run is below every replicate at both j. (b) spreads by ≤ 0.5% and PCM by ≤ 0.9%. Any (d) HBF figure needs
-  replicates.
-- **Within-second request order is not in the trace.** File order is used.
-  Randomizing it (request-level jitter) lowers the (b) hit rate by 2.8–3.4%: the
-  stock order favours reuse. For (d) HBF the effect has a consistent direction
-  (lower) and falls outside the clean range in 12/20 runs, but its size is not
-  pinned down. Against the clean-replicate mean it is −11% to −19%. Against the
-  stock run it is −40% to +29% per seed.
-- **(d)'s HBF write volume against concurrency is unresolved (PHASE 14
-  STEP 3).** It is not shown to be batch-driven, since the means are
-  non-monotone across caps. It is not invariant either: on T&A the means span
-  40.5% across caps and 18/28 cap pairs have non-overlapping 3-seed ranges. Do
-  not call (d) concurrency-invariant.
-- **(d)'s outcome is discrete under small perturbations (PHASE 14 STEP 3 extra
-  check).** At j = 0.005 × gap some seeds reproduce the stock store outcome
-  exactly, and others jump to a few other values. The stock run is one of
-  several states, common only at very small perturbation.
-- **PCM's own endurance is unpriced.** Largest open parameter.
-- **No day counts anywhere** — the far tier has no shared-bandwidth model.
-
-### Open parameters
-
-| parameter | status |
+| | Conv / T&A |
 |---|---|
-| PCM endurance (P/E cycles) | **OPEN** — to be sourced |
-| HBF dies per stack | **OPEN** — not needed for capacity (384 GB/stack is sourced) |
-| In-package DRAM (HBM3 / HBM3E) density | **DRAM density: placeholder figures recorded, primary source pending.** HBM3 0.16, HBM3E ~0.20 Gb/mm². From industry newsletters; NEEDS PRIMARY SOURCE (an ISSCC/IEDM HBM3E paper with die photo and area from SK hynix, Samsung or Micron) |
-| CAG corpus size, requests sharing it, transient KV per request | **OPEN** |
+| (b)→(c), raw, 8 runs (finite and unlimited HBF) | **50.22–50.25%** |
+| (b)→(c), residue-adjusted | **49.26–49.29%** |
+| finite vs unlimited HBF capacity | **≤ 0.01 pt** (pre-registered rule: within 5 pt → "not driven by HBF capacity": **passes**) |
+| HBF B/req (b) → (c) | 3,036,078,553 → 1,511,160,257 / 1,466,116,938 → 729,379,925 |
+| hit rate (b) vs (c) | 0.1898 vs 0.1898 / 0.4510 vs 0.4511 (keeps ~100% of the store's reuse benefit) |
+| HBF evictions (finite HBF) | (b) 1.97 M / 1.60 M; (c) 1.90 M / 1.54 M. **Immaterial:** with unlimited HBF, HBF bytes move ≤ 0.09% and hit rate ≤ +0.11%. The evicted keys are cold |
+| HBF occupancy with no capacity limit | peaks at 1.39× / 1.32× the pool. This is the trace's distinct-key footprint (an occupancy, not a capacity recommendation) |
+
+**Unlimited HBF** (`hbf_capacity_mode = unlimited`) is a sensitivity setting,
+not a hardware value.
+
+### Result 2 — ARGUED, NOT MEASURED: why the staging tier should be non-volatile and in-package
+
+**TokenSim does not support this part.** It rests on write-back semantics and
+on capacity-per-area figures, not on byte counts.
+
+**Why not DRAM. The primary argument is durability.**
+
+- Under write-back, an acknowledged block lives only in the staging tier until
+  it is demoted.
+- A volatile buffer in that role would lose acknowledged data on power
+  failure. This needs no density figure.
+- TokenSim cannot measure durability.
+- **Caveat:** KV blocks can be recomputed. For a cache, the loss costs
+  recomputation (time and energy), not correctness. The argument is weaker
+  here than for primary storage.
+
+**Supporting evidence only: placement.**
+
+- PCM's density is sourced: 0.62 Gb/mm², a planar die figure for 1st-gen
+  3D XPoint. That fits 43.4 GiB per GPU on top of the HBF stacks, **inside the
+  existing stack footprint**, taking no NAND capacity.
+- **No DRAM-density comparison is made** (decision 2026-10-22). Durability
+  carries the "why not DRAM" argument, and the placement claim needs no DRAM
+  figure. The newsletter placeholders stay in findings.md only.
+
+### Result 3 — MEASURED: read-gated demotion (d), the contribution
+
+(d) is a **selection policy, not an identity**: it demotes only blocks that
+PCM actually served. N = 4 per trace.
+
+| | Conv / T&A |
+|---|---|
+| **HBF writes vs (c)** | (d) writes 0.97–1.10% / 1.28–1.34% of (c)'s HBF bytes, i.e. drops **98.7–99.0%** |
+| HBF writes vs (b) | worst-case reduction **99.45% / 99.33%** (best 99.52% / 99.36%) |
+| (d) HBF B/req | **14.6–16.6 M / 9.3–9.8 M** |
+| (d) PCM B/req | **1.703–1.706 G / 0.815–0.816 G**. That is 11.6–11.7% / 10.6–10.7% more PCM writes than (c) (1.527 G / 0.737 G) |
+| reuse kept vs (b) | (d) keeps **53.0–53.7% / 87.8–88.0%** of (b)'s reuse-hit blocks (hit rate 0.1006–0.1019 / 0.3959–0.3966 vs 0.1898 / 0.4510) |
+| **…but most of that reuse needs no store** | **No store at all keeps 48.3% / 85.8%** (hit rate 0.0916 / 0.3870). So (d) keeps **9.2–10.5% / 13.9–15.1% of the store's reuse benefit**. Over no store, its hit rate is +9.8 to +11.2% / +2.3 to +2.5% |
+| PCM does the serving | PCM serves **72.6–76.5% / 71.3–73.9%** of (d)'s store-served tokens, against 6.3–7.2% in (b)/(c) |
+| the gate is real | every (d) demotion had a real PCM-served read (difference 0, 8 runs) |
+| **where (d)'s PCM writes come from** | first-time **89.54–89.67% / 90.23–90.29%**; **re-admission after an `if_read` drop 10.33–10.46% / 9.71–9.77%**; after an HBF eviction 0 |
+| why (d) writes more to PCM than (c) | those re-admissions account for **99.6–99.9% / 101.2–101.5%** of the (d) − (c) PCM-write difference, in blocks |
+| HBF bytes per reuse-hit block | (b) 21.3 M / 6.06 M; (c) 10.6 M / 3.01 M; **(d) 193–217 k / 44–46 k** |
+| lifetime ratio (b ÷ d) | ×182–×208 / ×150–×157 (quoted only as a range; B/req is the robust figure) |
+
+**Reading.** (d) trades reuse for writes.
+
+- It removes ~99% of the flash write stream.
+- It keeps only a tenth to a seventh of what the store adds over no store at
+  all.
+- PCM carries the reuse it does keep.
+
+It is the aggressive end of a write/reuse trade-off, not a free improvement.
+
+### Result 4 — break-even PCM endurance (a threshold, not a verdict)
+
+**Question.** At what PCM endurance (cycles) do PCM and HBF exhaust their write
+budgets at the same moment?
+
+```
+E_PCM = (HBF_capacity × 3000 / HBF_B_per_req) × PCM_B_per_req / PCM_capacity
+HBF_capacity = 1,258,291 × 2,621,440 B = 3,298,534,359,040 B   (per writing GPU)
+PCM_capacity =    17,776 × 2,621,440 B =    46,598,717,440 B   (per writing GPU)
+HBF endurance 3000 P/E (TLC)
+```
+
+- Both capacities must be on the same basis: both per writing GPU, or both
+  pool. E_PCM is the same either way.
+- Mixing them, e.g. a 12 TiB HBF pool against 43.4 GiB of PCM, is a 4×
+  error.
+
+| | Conv | T&A |
+|---|---|---|
+| (b), the DRAM buffer read as if it were PCM | 106,721 | 106,751 |
+| **(c)** | **214,535** | **214,657** |
+| **(d), range over N = 4** | **21,726,973 – 24,762,024** | **17,725,533 – 18,584,178** |
+| (d) ÷ (c) | 101.3 – 115.4 | 82.6 – 86.6 |
+
+**Sanity check.** E_d ÷ E_c = (HBF_c ÷ HBF_d) × (PCM_d ÷ PCM_c) holds in all 8
+(d) runs. It is an algebraic identity, so it checks only the arithmetic.
+
+**Assumptions:**
+
+| | assumption | status |
+|---|---|---|
+| 1 | perfect wear levelling in both tiers | **optimistic**. Relaxing it raises the (d) threshold |
+| 2 | HBF write amplification = 1 | **optimistic**. Relaxing it raises the (d) threshold |
+| 3 | every write is a full-block write at both tiers | **optimistic**. Relaxing it raises the (d) threshold |
+| 4 | each writing GPU's PCM:HBF write ratio equals the pooled ratio | **UNTESTED**. Per-rank write counts are not recorded |
+
+Further notes:
+
+- Published chip-level PCM endurance already absorbs some cell variability. A
+  comparison must not add a further levelling penalty on top of it; that would
+  double-count.
+- **End-of-run residue** (3.70–3.97% of would-be admissions on full traces):
+  - if those blocks were spilled and demoted at each config's own rate, every
+    threshold moves by −0.02% to −0.04%;
+  - if they were spilled and never demoted, every threshold rises by +3.8% to
+    +4.1% (upper bound).
+- HBF also holds the model weights (60.38 GiB per GPU). Without static wear
+  levelling, the HBF budget would be ~2% smaller.
+- **No published PCM endurance figure is compared here.** That comparison
+  (A4.1) is the author's to write.
+
+**Endurance as a swept axis.** Because no endurance figure exists for the PCM
+generation whose density we use (A4.1), PCM endurance is treated as an axis,
+not a constant.
+
+- Requests to first wear-out are computed for every assumed endurance from 10⁵
+  to 10¹² cycles. This is derived from the measured B/req; no new runs.
+- A tier lasts capacity × endurance ÷ B/req requests, and the system lasts as
+  long as its first tier.
+- **(b)'s buffer is DRAM, so (b) is always HBF-limited.**
+
+| assumed PCM endurance | (d) ÷ (c), Conv | (d) ÷ (c), T&A | binding tier for (d) |
+|---|---|---|---|
+| 10⁵ | 0.89 – 0.90 | 0.90 | PCM. (c) is PCM-limited too and lasts *less* than (b) |
+| 3 × 10⁵ | 1.25 | 1.26 | PCM |
+| 10⁶ | 4.17 – 4.18 | 4.21 | PCM |
+| 10⁷ | 41.7 – 41.8 | 42.1 | PCM |
+| ≥ 10⁸ | **90.8 – 103.3** | **74.7 – 78.3** | HBF (plateau = the HBF write ratio) |
+
+**Two thresholds, with different meanings:**
+
+| threshold (cycles) | Conv | T&A | meaning |
+|---|---|---|---|
+| **(d) outlives (c)** | **≈ 2.39–2.40 × 10⁵** | **≈ 2.37–2.38 × 10⁵** | where read-gating becomes **net-positive**. Below it, (d)'s extra PCM writes (+11.5–11.7% / +10.6–10.7% PCM B/req, almost all re-admissions) wear PCM out before (c) |
+| (d) outlives (b) | ≈ 1.19 × 10⁵ | ≈ 1.18 × 10⁵ | where (d) beats the DRAM-buffer baseline |
+| break-even E_PCM for (d) | 2.17–2.48 × 10⁷ | 1.77–1.86 × 10⁷ | above this, more PCM endurance buys nothing; (d) is HBF-limited |
+
+Script: `breakeven_pcm.py WORK sweep`. The figure for the paper is lifetime
+ratio vs assumed endurance (log x-axis) with the thresholds marked.
+
+### A4.1 Literature comparison — references verified
+
+Supplied by the author on 2026-10-22. Every reference was checked against
+Crossref and/or the publisher on the same day (findings.md, "PCM ENDURANCE
+LITERATURE — verified references").
+
+| published figure | value | reference | use |
+|---|---|---|---|
+| spread of PCM endurance, mushroom-type cells | **10⁶ – 10⁹ cycles** | J. Zheng *et al.*, *Nature Communications* 16, 5788, 2025, doi:10.1038/s41467-025-60644-1 (open access) | the framing sentence for the spread |
+| record, ALD-confined cell with metallic liner | **2 × 10¹² cycles** | W. Kim *et al.*, "ALD-based confined PCM with a metallic liner toward unlimited endurance," *IEDM 2016*, pp. 4.2.1–4.2.4, doi:10.1109/IEDM.2016.7838343 | cite this for the number, not a review |
+| 1st-gen XPoint module (Optane DC PMem) | **not published** ("N/A"; "we could not find any actual endurance data of the DCPMMs") | P. Götze, A. K. Tharanatha, K.-U. Sattler, arXiv:2001.02172, 2020, Table 1 (short paper at DaMoN 2020) | the negative claim only. The table compiles other sources, so it is not a source for its DRAM or NAND values |
+| why figures spread (stuck-SET from segregation, stuck-RESET from voids; both atomic migration) | — | S. Kim, G. W. Burr, W. Kim, S.-W. Nam, *MRS Bulletin* 44(9), 710–714, 2019, doi:10.1557/mrs.2019.205 | framing |
+| general PCM background | — | H.-S. P. Wong *et al.*, *Proc. IEEE* 98(12), 2201–2227, 2010; G. W. Burr *et al.*, *J. Vac. Sci. Technol. B* 28(2), 223–262, 2010 | framing |
+
+**Positions against our thresholds** (stated as positions; the comparison is
+the author's to write):
+
+| figure | where it falls |
+|---|---|
+| mushroom-cell spread, 10⁶–10⁹ | above (d)'s net-positive threshold (≈ 2.4 × 10⁵); overlaps (d)'s break-even (1.8–2.5 × 10⁷) |
+| confined-cell record, 2 × 10¹² | above both |
+
+**Generation mismatch. This must be stated in the thesis, not hidden.**
+
+- Our PCM **density** (0.62 Gb/mm²) is 1st-gen 3D XPoint.
+- Intel never published write endurance for those products (Optane DC
+  Persistent Memory).
+- The circulating figures (50 k–500 k, 200 k, 10 M cycles) are analyst
+  back-calculations from a petabytes-written rating. They are **not citable**
+  and are used nowhere.
+- So any published PCM endurance figure comes from a **different technology or
+  generation** than the density figure.
+- This is why endurance is a swept axis (Result 4), not a constant.
+
+
+### Measurement conditions (all configurations, full traces)
+
+| | Conv / T&A |
+|---|---|
+| end-of-run HBM residue | 3.70–3.82% / 3.87–3.97% of would-be store admissions. It fell roughly in proportion to request count from W = 5,000, as pre-registered. It undercounts absolute B/req in every config |
+| HBF read-back share | (b) 4.61% / 4.18%; (c) 9.24% / 8.56%; (d) 23.7–25.5% / 22.3–25.7% |
+| HBF evictions | (b)/(c) only (Result 1). (d) never evicts. At W = 5,000 nothing evicts |
+| batch per active scheduler | (b) 47.09 / 45.63; (c) +0.03% / −0.40% vs (b); (d) −0.59% to −0.66% / −1.86% to −2.06% vs (b). Arms are batch-matched |
+
+## A5. Variants and the earlier reference window
+
+**W = 5,000** (the first 5,000 requests) was the headline window until
+2026-10-12. Compare it with A4 by metric, not by digit: the replay pace and the
+jitter values differ. (d) here is pooled over N = 16.
+
+| | Conv / T&A |
+|---|---|
+| (b)→(c) raw | 50.53% / 51.31% (residue-adjusted 48.38% / 46.49%) |
+| (b)→(d) worst case | 99.36% / 99.12% |
+| (d) HBF B/req | 14.8–20.7 M / 4.9–12.9 M |
+| (d) hit rate vs (b) | −37.5% to −39.1% / −6.8% to −7.7%. Store benefit kept 15.4–18.8% / 9.8–20.6% |
+| end-of-run residue | 8.2–8.4% / 16.7–17.0%, the main reason the full traces became the headline |
+
+**Variants**, each measured under a different model and labelled with it:
+
+| variant | result | where |
+|---|---|---|
+| copy-at-admission (stock entry), (b)→(c) | 50.81% / 50.99% | PHASE 14 headline set |
+| copy-at-admission, (d) | **equivalent to no store**: with honest bookkeeping, 0 HBF writes and 0 store-served tokens | PHASE 14 V1 |
+| spill + from-zero lookup | degenerate: the store serves 0 / 769 of 5,000 lookups | STEP 3b |
+| 86.8 GiB/GPU PCM (142,213 blocks, global LRU) ≈ 2nd-gen XPoint density | (b)→(c) 51.10% / 52.18% | PHASE 9 STEP 3 |
+| (b)/(c) HBF wear vs concurrency (copy-at-admission) | 0.50% / 1.10% spread over a 12× batch range. **Not established under the headline**, where HBM eviction is the store's only writer | PHASE 9 STEP 4 |
+| hit rate vs PCM capacity (copy-at-admission, global) | flat over a 150× capacity sweep | PHASE 10 |
+| falsifier: does HBM eviction drive HBF writes under copy-at-admission? | no: +0.00% / −0.07% over an 11× batch range | PHASE 12 |
+| shared (`global`) vs private (`per_rank`) pool at 71,104 (copy-at-admission) | (b)/(c) ≤ 0.22%. The (d) difference measured then (−13.8% / −24.5%) came from the lookup-bookkeeping artefact (A6 #3) and is not quoted | STEP 3a |
+
+## A6. Corrections and retractions
+
+These were found during the work. Each is in findings.md with its evidence.
+
+| # | what was reported | what is true | where |
+|---|---|---|---|
+| 1 | **PHASE 9 headline**: the cap-256 table, e.g. (b)→(c) 51.2% / 52.6% | cap 256 is a saturated operating point with large batch gaps ((d) vs (b) −4.7% / −7.7%). It was replaced by batch-matched cap 48, and later by the full-trace headline | PHASE 14 STEP 1 |
+| 2 | **The LaTeX headline did not match its own table.** Prose said ×90.3 / ×86.4 (PHASE 8, batch-unmatched); the table gave ×79.8 / ×58.1 | ratios are quoted only as ranges paired with bytes/request | STEP 1e |
+| 3 | **The lookup bookkeeping bug.** (d)'s 99.6%+ reductions under copy-at-admission came from `if_read` credit given to every key a lookup *walked*, including HBM-served blocks (`store.py:125`) | PCM never served a read under copy-at-admission (332 runs). With honest bookkeeping (d) ≡ no store. The read-back "mechanism" and every (d) variability analysis built on it (timing arms, replicates, concurrency sweep, pooled bound) are retracted or qualified as describing the artefact | set A; V1 |
+| 4 | **TP-rank-0 scheduling.** All 8 workers were assumed to write | only the 4 TP-0 workers are scheduled. The 142,213-block pool was 86.8 GiB per writing GPU (2× the design), batch figures were half the real value, and requests-to-wear-out against 24 TiB was 2× too high | STEP 3a |
+| 5 | **Shared global LRU.** One store LRU served all ranks | a block admitted by one GPU could evict another GPU's block (73.6–75.9% of evictions were cross-rank). Replaced by private per-rank pools, the faithful model of in-package PCM | STEP 3a |
+| 6 | **`--random_seed` was taken as a replicate source** | it is inert on these traces. Replicates use burst-level arrival jitter | STEP 2b |
+| 7 | the earlier jitter assumed 1 ms timestamp resolution | timestamps are whole seconds, so ±0.5 ms jitter only reorders requests within a burst (a workload variant). Replaced by burst-level jitter | STEP 2b |
+| 8 | PCM tier configured at ~4 GiB (an early phase) | a 10× error. Every `if_read` result under it is **void**, not negative | CLAUDE.md, early phases |
+| 9 | HBF-1/HBF-2 hardware entries (HBM given up for flash, −10% bandwidth derate) | wrong topology; superseded by `H3-B200-KVONLY` | CLAUDE.md |
+| 10 | "HBF never evicts" | true only at W = 5,000. On full traces (b)/(c) evict 1.5–2.0 M cold blocks, which is immaterial (Result 1) | HBF capacity check |
+| 11 | PHASE 12: "the previous output is a minority of what a continuation adds" | wrong for Conversation: output is 67.3% of the added tokens | PHASE 13 |
+| 12 | `--share_partial_tail` as a fix for the tail-reuse floor | it lowers the hit rate instead. The floor stands as a limitation | PHASE 13 |
+| 13 | "~10⁸ PCM endurance" in early notes | unsourced. PCM endurance is OPEN, now framed as a threshold (Result 4) | STEP 1 |
+
+## A7. Open parameters
+
+| parameter | status | what was used |
+|---|---|---|
+| **PCM endurance** | **OPEN → a swept axis with thresholds** (Result 4). No published figure exists for the 1st-gen XPoint generation whose density we use (Götze *et al.*). Published PCM spread 10⁶–10⁹ (mushroom), record 2 × 10¹² (confined): A4.1 | none assumed; swept 10⁵–10¹² |
+| HBF dies per stack | **OPEN**. Not needed for capacity (384 GB/stack is sourced) | — |
+| TLC density 29 Gb/mm² | **OPEN** (uncited; unit unknown) | only to size the PCM die area |
+| PCM die area 35 mm² | **OPEN**, derived from the uncited 29 Gb/mm² (1 Tb TLC die ≈ 35.3 mm², kept as 35) | 2 × 35 mm² per stack |
+| **HBF write timing** | **unsourced**: TokenSim's stock SSD default | **200 µs, 3.0 GiB/s** in every run |
+| PCM media timing | **ASSUMED** | 0.1 / 1.0 µs, 100 / 20 GiB/s |
+| DRAM (HBM3/HBM3E) density | **not needed: dropped** (decision 2026-10-22). Placeholders stay in findings.md; not citable | not used anywhere |
+| CAG corpus size, sharing factor, transient KV per request | **OPEN** | Mooncake traces stand in |
+
+## A8. What is not claimed, and why
+
+- **No latency or throughput numbers.**
+  - This phase tests the write-absorption *idea*: how many bytes reach each
+    tier, and what reuse survives.
+  - TokenSim's store is a per-operation latency function with assumed or
+    unsourced timing, no shared bandwidth and no far-tier queueing. Its timing
+    is good enough to schedule the replay; it does not give latency or
+    throughput results.
+  - The arms are batch-matched at 30 QPS (cap 48 per scheduler, running at
+    45.6–47.1). Their timing differences are not results.
+  - **Latency and throughput are the next phase**, on a simulator that models
+    them.
+- **No lifetime in days.**
+  - Days need a write rate, and that needs a shared far-tier bandwidth model,
+    which does not exist yet (STEP 6, planned).
+  - Wear is given as bytes per request, as reductions, and as the break-even
+    threshold.
+- **No verdict on PCM wear-out.** Result 4 is a threshold, not a comparison
+  with published figures.
+- **The density and endurance figures come from different generations.** No
+  endurance is published for the 1st-gen XPoint products whose density we use
+  (A4.1).
+- **No claim that PCM's medium causes the 50%.** It is a write-policy identity
+  (Result 1).
+- **No concurrency-invariance claim under the headline.** It was measured only
+  under copy-at-admission (A5).
+- **Generated KV is out of scope.** The store holds prompt blocks only
+  (2.58% / 1.94% of tokens are generated).
+- **FP8 is not modelled.** Precision is hardcoded FP16; FP8 would halve all
+  bytes.
+- **No NAND-level write amplification.** WAF = 1 is assumed, and that is
+  optimistic. A NAND-level simulation (MQSim) is out of scope for this work.
+
+## A9. Next steps
+
+| | item | status |
+|---|---|---|
+| 1 | Literature for A4.1 is verified. The author is downloading the paywalled papers (`Documents/Research_papers/README.md`) | in hand |
+| 2 | LaTeX micro-paper rewrite from Part A | next |
+| 3 | STEP 5: `--content_aligned_tail` (tail-sharing sensitivity) | not started |
+| 4 | STEP 6: shared far-tier bandwidth model (`offload_bandwidth_model = per_op \| shared`), **ASSUMED** 30 / 48 GB/s per stack (27.94 / 44.70 GiB/s). Mechanism only, no experiments | not started |
+| 5 | latency/throughput on a timing-faithful simulator | next phase |
+| 6 | per-rank write counters (to test assumption 4 of Result 4) | not built |
+| 7 | Option 2: store generated KV (`TokenSim/docs/option2-output-kv-scope.md`) | scoped, not built |
+| 8 | MQSim WAF/GC run to replace WAF = 1 | **out of scope** (decision 2026-10-22). WAF = 1 stays an optimistic assumption |
+| 9 | CAG workload definition | OPEN |
 
 ---
+
+# Part B — working record
+
+> Kept for traceability. Numbers here may be superseded by Part A. The earlier
+> "Status at a glance" and "Next steps" sections are replaced by Part A; their
+> history is in the weekly log below and in findings.md.
+
 
 ## Weekly log
 
 > Newest first. Keep entries short: what was done, what moved, what is next.
+
+### 2026-10-17 to 2026-10-22 — PHASE 14: framing, HBF capacity settled, break-even endurance, report rewrite
+
+- **Framing decided.** (c)'s halving is a write-policy identity that
+  characterises the baseline; (d) is the contribution. The case for a
+  non-volatile in-package tier is argued, not measured, and durability leads
+  the "why not DRAM" argument.
+- **HBF capacity settled.** 5,033,164 is the pool; the code splits it into
+  1,258,291 blocks (3 TiB) per writing GPU (`ssd.py:157-158`, recorded as
+  `partition_rank_ssd_capacity_blocks`). Block size was confirmed two ways
+  at 2,621,440 B.
+- **Break-even PCM endurance:**
+  - (c) ≈ 214.5 k cycles;
+  - (d) 21.7–24.8 M (Conv) / 17.7–18.6 M (T&A);
+  - three optimistic assumptions and one untested.
+- **(d) PCM admissions by source, N = 4.** Re-admission after an `if_read`
+  drop is 10.33–10.46% / 9.71–9.77% of (d)'s PCM writes. That accounts for
+  essentially all of (d)'s extra PCM writes over (c).
+- **DRAM density recorded as a PLACEHOLDER** (newsletters; needs a primary
+  source).
+- **report.md restructured.** Part A is a self-contained report of what was
+  built, how it was measured, results, corrections, open parameters and what is
+  not claimed. Part B keeps the working record.
+- No simulator code changed in this period.
 
 ### 2026-10-12 — PHASE 14: HBF capacity check, admission counter, full-trace headline
 
@@ -681,7 +981,7 @@ At W = 5,000, re-admissions are ~7.2–7.7% / 5.1–5.7% of (d)'s PCM writes.
 
 ---
 
-## Current numbers
+## Superseded numbers (before the 2026-10-12 headline; PCM 142,213 / HBF 10,066,329 blocks, W = 5,000)
 
 > Config (b) = a write-through DRAM buffer (same pool size as the PCM tier) in
 > front of HBF, write-through + always — not "HBF only". (c) = +PCM, write-back +
@@ -764,24 +1064,28 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
 
 ---
 
-## Next steps
-
-| | item | status |
-|---|---|---|
-| 1 | **Option 2 — store generated KV.** Design note at `TokenSim/docs/option2-output-kv-scope.md`; three decisions open at its §7. | scoped, **not built** |
-| 2 | **Source PCM endurance.** Blocks any claim about the PCM tier's own wear. | OPEN |
-| 3 | **MQSim WAF/GC run.** Would replace the WAF = 1 assumption. MQSim is not currently in the tree. | not started |
-| 4 | **CAG workload definition.** Corpus size, sharing factor, transient KV per request. | OPEN |
-| 5 | **Narrower tail-sharing rule** — multi-chunk stems only, applied consistently across siblings — to test the PHASE 13 limitation properly. | proposed |
-| 6 | Figures for the paper: capacity sweep and concurrency sweep as `pgfplots`. | not started |
-
----
-
 ## Pending LaTeX sync
+
+> **2026-10-22: the single LaTeX rewrite applied every item below** (chunks
+> 1–4, each reviewed by the author). Items are kept as a record and ticked.
+>
+> **Still open for the paper:**
+> - The file has **never been compiled**: there is no LaTeX toolchain on this
+>   machine. A brace, environment, reference and citation check passes.
+> - Bibliography complete and verified (2026-10-22): `h3` (Ha, Kim, Kim, IEEE
+>   CAL 25(1) 49–52), `tokensim` (Wu *et al.*, arXiv:2503.08415), `mooncake`
+>   (Qin *et al.*, FAST'25 155–170; the FAST title differs from the arXiv
+>   title), `vllm` and `mqsim` (pages added).
+> - The only figure is the endurance sweep (pgfplots).
+> - The venue template (IEEEtran vs acmart) needs checking against the current
+>   call for papers.
 
 > **One LaTeX rewrite, after STEP 4.** Every item below is listed, not applied.
 
-- [ ] **"Why not DRAM" (2026-10-17).**
+- [x] **DRAM density dropped (2026-10-22).** The paper makes no DRAM-density
+      comparison. Durability leads, and the placement claim ("inside the
+      existing HBF stack footprint") is the only area statement.
+- [x] **"Why not DRAM" (2026-10-17).**
   - Lead with **durability**: under write-back, acknowledged data lives only
     in the staging tier, so a volatile buffer would lose it on power failure.
     Include the recomputable-KV caveat.
@@ -794,7 +1098,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
     - Never use the ~0.33 Gb/mm² TSV-penalised figure (author's
       illustrative arithmetic).
 
-- [ ] **FRAMING (2026-10-17). This supersedes "(c) as the primary result" in
+- [x] **FRAMING (2026-10-17). This supersedes "(c) as the primary result" in
       the NEW HEADLINE item below.** Structure the abstract, contributions,
       `sec:headline` and the Conclusion as three separately labelled claims.
   1. **Measured, an identity (baseline characterisation, not a
@@ -827,7 +1131,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
   - Retire every "(c) is the primary result" and "PCM halves flash writes"
     phrasing.
 
-- [ ] **NEW HEADLINE (2026-10-12).** Spill-only + vLLM-style lookup + honest
+- [x] **NEW HEADLINE (2026-10-12).** Spill-only + vLLM-style lookup + honest
       read bookkeeping, 43.4 GiB/GPU per_rank, cap 48.
   - Rewrite the abstract, contributions, `tab:headline`, `sec:headline` and
     the Conclusion around **(c) as the primary result** (~50.5–51.3% in every
@@ -840,41 +1144,41 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
   - **State that the headline was chosen on modelling grounds and lowers (d)'s
     reduction.** STEP 4 full-trace numbers replace the W = 5,000 ones if they
     differ.
-- [ ] **STEP 4 (full traces) — DECIDED: full traces are the headline window**
+- [x] **STEP 4 (full traces) — DECIDED: full traces are the headline window**
       (2026-10-12). W = 5,000 can appear as an earlier reference only.
   - (c) ~49–50%: raw 50.23 / 50.25%, residue-adjusted 49.29 / 49.26%.
   - (d) worst case 99.45 / 99.33%; (d) hit rate −47% / −12% vs (b); store
     benefit kept 9–15%.
   - Note the HBF-capacity regime on full traces: (b)/(c) evict, (d) does not.
-- [ ] **Describe (b) exactly.** It is a 71,104-block write-through DRAM buffer
+- [x] **Describe (b) exactly.** It is a 71,104-block write-through DRAM buffer
       in front of HBF, serving 6.9% / 7.2% of (b)'s store-served tokens on full
       traces. Not "HBF only": retire that label wherever it appears.
-- [ ] **(c)'s halving is a write-policy identity** ((b) HBF = admissions +
+- [x] **(c)'s halving is a write-policy identity** ((b) HBF = admissions +
       demotions, (c) HBF = demotions). State the HBF capacity check result.
       Framing decided 2026-10-17: see the FRAMING item above.
-- [ ] **Read path:** PCM or HBF serve directly into HBM. HBF hits are not
+- [x] **Read path:** PCM or HBF serve directly into HBM. HBF hits are not
       re-admitted to PCM (`store.py:179-182`, `:234-237`).
-- [ ] **Architecture / method:** describe spill-only entry (HBM evicts → PCM),
+- [x] **Architecture / method:** describe spill-only entry (HBM evicts → PCM),
       the vLLM-style lookup beyond the HBM hit, and read credit on actual
       serve. Retire "each prompt block is copied to PCM at admission" as the
       model description; it is the variant.
-- [ ] **Retract** any read-back mechanism text ("one read in PCM passes
+- [x] **Retract** any read-back mechanism text ("one read in PCM passes
       `if_read`"), and any (d) variability, concurrency or j-size discussion
       presented as a property of the design.
 
-- [ ] **Architecture/Methodology wording (PHASE 14 STEP 3b).** State plainly
+- [x] **Architecture/Methodology wording (PHASE 14 STEP 3b).** State plainly
       that **"each prompt block is copied to PCM at admission"** (the prefill
       save). Nothing should imply that HBM evictions spill into the store.
       Lines that currently imply it: l.102 ("a KV store that absorbs spill
       from HBM"), l.170 ("HBF receives the spill stream from a KV store") and
       l.379 ("The residual is the genuine spill"). Reword them to "the store's
       overflow/demotion stream".
-- [ ] **From-zero result, one sentence:** *"If blocks enter the store only on
+- [x] **From-zero result, one sentence:** *"If blocks enter the store only on
       HBM eviction and the store is looked up from the first prompt block, the
       HBM-resident prompt head is never stored and the store serves almost no
       reuse (0 and 769 of 5,000 lookups); copy-at-admission is required for
       the store to be useful under that lookup."*
-- [ ] **Robustness paragraph for Evaluation, rewritten from set B** (replaces
+- [x] **Robustness paragraph for Evaluation, rewritten from set B** (replaces
       the draft below). Draft: *"Robustness to the PCM entry model. We also
       let blocks enter the store only when HBM evicts them, with the store
       queried, as in vLLM's connector interface, only for tokens beyond those
@@ -885,11 +1189,11 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
       copy-at-admission figure (18.8–24.4 MB vs 6.0–11.7 MB per request,
       conversational). By our pre-registered rules the headline numbers
       therefore depend on how blocks enter PCM."*
-- [ ] **Read-gate accounting (PHASE 14 correction).** Any (d) mechanism text
+- [x] **Read-gate accounting (PHASE 14 correction).** Any (d) mechanism text
       must say that under copy-at-admission PCM serves no reads, and that the
       gate was opened by lookup touches (`store.py:125`). Wait for the
       headline-lookup decision before rewriting.
-- [ ] *(superseded by the set-B paragraph above)* **Robustness paragraph for
+- [x] *(superseded by the set-B paragraph above)* **Robustness paragraph for
       Evaluation (PHASE 14 STEP 3b)** — one short paragraph; headline tables
       unchanged. Draft:
       *"Robustness to the PCM entry model. If blocks enter the store only when
@@ -905,19 +1209,19 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
 - [x] **0.62 Gb/mm² cited (2026-10-11).** `\cite{ehrmann2022pcm}` is at the
       contribution item and the density line, replacing "derived from
       published die parameters". The bib entry is complete (supplied fields).
-- [ ] **Mechanism paragraph for (d).** Within the window, ~98% (T&A) /
+- [x] **Mechanism paragraph for (d).** Within the window, ~98% (T&A) /
       ~70–76% (Conv) of the HBF writes (d) avoids at the design pool, against
       2× capacity, are blocks that pass `if_read` at the larger pool but are
       not read back from HBF. Read-back figures are in-window lower bounds.
-- [ ] **Still uncited: 35 mm² (PCM die) and 29 Gb/mm² (TLC density).** The
+- [x] **Still uncited: 35 mm² (PCM die) and 29 Gb/mm² (TLC density).** The
       29 Gb/mm² unit stays OPEN until sourced. Note the 35 vs 35.3 mm²
       rounding (< 1% capacity).
-- [ ] **Add a limitation line:** 2nd-gen (4-deck) XPoint roughly doubles
+- [x] **Add a limitation line:** 2nd-gen (4-deck) XPoint roughly doubles
       density, which is approximately the 86.8 GiB/GPU point (142,213, global
       pool). No runs for it.
-- [ ] **Wording rule:** nowhere call 0.62 Gb/mm² "conservative" overall. A
+- [x] **Wording rule:** nowhere call 0.62 Gb/mm² "conservative" overall. A
       smaller pool lowers (c)'s reduction and raises (d)'s.
-- [ ] *(superseded by the items above)* **Uncited die figures (PHASE 14
+- [x] *(superseded by the items above)* **Uncited die figures (PHASE 14
       decision record).** l.207–216 give 35 mm² per PCM die, 0.62 Gb/mm² PCM
       density and 29 Gb/mm² TLC density with **no `\cite`**.
   - **TLC sets two things in this paper:** PCM capacity (the PCM die is the
@@ -927,7 +1231,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
     If the density source is decimal, PCM is 40.42 GiB/GPU. The "1 Tbit die
     ≈ 35.3 mm², 128 GiB" (l.215–216) also assumes binary Tbit; decimal gives
     34.5 mm². Fix all three together once confirmed.
-- [ ] **Headline configuration change (PHASE 14 decision record) — numbers now
+- [x] **Headline configuration change (PHASE 14 decision record) — numbers now
       available (headline set).** The headline becomes design capacity +
       `per_rank`:
       - (b)→(c) 50.81% / 50.99%;
@@ -941,7 +1245,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
       current 142,213-block figures are the **86.8 GiB/GPU point**. Add the
       (d) cost metrics: hit rate vs (b), and HBF bytes per reuse-hit block.
 
-- [ ] **8-writer assumptions (PHASE 14 STEP 3a audit).** List only, not fixed.
+- [x] **8-writer assumptions (PHASE 14 STEP 3a audit).** List only, not fixed.
       Only 4 TP-0 workers are scheduled and write.
   - **Capacity.** "43.4 GiB per GPU" is attached to 142,213-block results: the
     abstract l.56 and l.69, contributions l.112, l.288 (pool = 43.4 × 8), the
@@ -971,18 +1275,18 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
 > What is in this report / `findings.md` but **not yet** in
 > `../Latex/pcm-kv-micro.tex`. Clear entries as they are moved across.
 
-- [ ] Bibliography is incomplete — five entries marked `% TODO` (author lists,
+- [x] Bibliography is incomplete — five entries marked `% TODO` (author lists,
       volumes, page ranges, DOIs). **Must be filled before submission.**
-- [ ] Paper has **not been compiled** — no LaTeX toolchain on this machine.
+- [x] Paper has **not been compiled** — no LaTeX toolchain on this machine.
       `sudo apt install texlive-publishers texlive-latex-extra texlive-science`
-- [ ] Confirm the MICRO template for the target year. The draft targets
+- [x] Confirm the MICRO template for the target year. The draft targets
       `IEEEtran[conference]`; the switch to `acmart/sigconf` is a commented
       one-liner in the header.
-- [ ] Author block is a placeholder guess.
-- [ ] No figures yet (next steps #6).
-- [ ] PHASE 13's tail-sharing negative result is summarised in the Limitations
+- [x] Author block is a placeholder guess.
+- [x] No figures yet (next steps #6).
+- [x] PHASE 13's tail-sharing negative result is summarised in the Limitations
       section but not given its own subsection — decide whether it earns one.
-- [ ] **Stale headline figures (PHASE 14 STEP 1d), listed only, not fixed.**
+- [x] **Stale headline figures (PHASE 14 STEP 1d), listed only, not fixed.**
       Line numbers are in `pcm-kv-micro.tex` at `ced3806`:
   - Abstract, l.59–63: "51.2% / 52.6%", "98.8% / 98.3%" (cap-256, saturated)
     and "90.3× / 86.4×" (PHASE 8, batch-unmatched). Cap-48 values:
@@ -995,7 +1299,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
   - l.384–385: "matched to within 4.7% and 7.7%" is the saturated spread. It
     should be labelled as such.
   - Conclusion, l.609–611: "51–53%", "98–99%", "90×".
-- [ ] **Unsourced statements in the LaTeX (PHASE 14 STEP 1b/1c), listed only:**
+- [x] **Unsourced statements in the LaTeX (PHASE 14 STEP 1b/1c), listed only:**
   - l.177: PCM "write endurance is orders of magnitude higher". This is
     unsourced, and PCM endurance is OPEN.
   - l.273–274: flash writes "NAND-realistic at 200 µs and 3 GB/s". These are
@@ -1003,19 +1307,19 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
     GiB/s.
   - The PCM media timing (0.1/1.0 µs, 100/20 GiB/s, `config.py:81-84`) is never
     stated in the paper. It is assumed and should be disclosed as such.
-- [ ] **HBF write bandwidth unit (PHASE 14 STEP 1).** The LaTeX (l.274,
+- [x] **HBF write bandwidth unit (PHASE 14 STEP 1).** The LaTeX (l.274,
       `\SI{3}{\giga\byte\per\second}`) and the project record (findings.md
       ~2802, ~3829, ~4531) say HBF writes run at "3 GB/s". The knob
       `ssd_write_bw_gbps = 3.0` is divided by 2^30 (`ssd.py:116-121`), so it is
       **3.0 GiB/s** (3.22 GB/s).
-- [ ] **Headline ratio mismatch (PHASE 14 STEP 1e).** The prose says ×90.3 / ×86.4
+- [x] **Headline ratio mismatch (PHASE 14 STEP 1e).** The prose says ×90.3 / ×86.4
       (PHASE 8), but `tab:headline`'s own B/req give ×79.8 / ×58.1 (cap 256). The
       canonical figure is ×80.4 / ×98.8 (cap 48), quoted with its bytes/request.
-- [ ] **(d) is now quoted as a pooled bound (PHASE 14 STEP 3).** This
+- [x] **(d) is now quoted as a pooled bound (PHASE 14 STEP 3).** This
       supersedes the item below. Use the worst-case reduction 98.72% (conv) /
       98.44% (T&A), with N = 16 and the (d) HBF B/req range 32.0–43.0 M /
       17.2–26.3 M at cap 48. Ratios only as ranges: ×78.3–×105.2 / ×64.3–×98.8.
-- [ ] **(d) must be quoted as ranges (PHASE 14 STEP 2).** The abstract,
+- [x] **(d) must be quoted as ranges (PHASE 14 STEP 2).** The abstract,
       `sec:headline` and the Conclusion must quote config (d) as a reduction
       range plus an HBF B/req range, not a single ratio:
       - reduction 98.76–98.89% (conv) / 98.41–98.99% (T&A)
@@ -1026,7 +1330,7 @@ capacity moves (d) HBF a further −13.8% / −24.5% (ranges do not overlap), an
       98.44–98.83%, (d) HBF B/req 32.0–41.9 M / 19.8–26.3 M and, if a ratio is
       given, ×80.5–×105.2 / ×64.3–×85.7. State that the PHASE 9 T&A ×98.8 lies
       above every replicate.
-- [ ] **Concurrency claim over-reaches (PHASE 14 STEP 1f, STEP 3).** Replace
+- [x] **Concurrency claim over-reaches (PHASE 14 STEP 1f, STEP 3).** Replace
       any "concurrency-invariant" wording for (d) in `sec:batch` and the
       Conclusion with:
       *"reduction ≥ 98.66% (conversational) / ≥ 98.28% (tool/agent) at every

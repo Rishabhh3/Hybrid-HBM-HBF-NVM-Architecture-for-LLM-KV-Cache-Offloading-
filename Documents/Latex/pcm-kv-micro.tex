@@ -22,6 +22,8 @@
 \usepackage{graphicx}
 \usepackage{xcolor}
 \usepackage{siunitx}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
 \usepackage[hidelinks]{hyperref}
 
 \sisetup{group-separator={,}, group-minimum-digits=4}
@@ -44,35 +46,33 @@ rishabh.chamoli@iitg.ac.in}}
 %==============================================================================
 \begin{abstract}
 %==============================================================================
-High-Bandwidth Flash (HBF) promises roughly $16\times$ the capacity of HBM at
-comparable bandwidth, making it an attractive destination for the KV cache of
-large-language-model inference. Proposals such as H3 place HBF behind HBM in a
-daisy-chained hierarchy, but confine it to \emph{read-only} data---model weights
-and shared, pre-computed KV---precisely because NAND write endurance is the
-weak point of the technology. We ask what happens to that hierarchy under
-general write-heavy serving, where the flash tier does receive a transient write
-stream, and whether a small bit-alterable NVM tier can absorb it.
+High-Bandwidth Flash (HBF) offers roughly $16\times$ the capacity of HBM at
+comparable bandwidth, and H3 places it behind HBM in a daisy-chained hierarchy.
+H3 confines HBF to read-only data because NAND write endurance is the
+technology's weak point. We study the write-heavy case it excludes: KV blocks
+spilled from HBM into a store backed by HBF. We ask whether a small
+non-volatile staging tier of phase-change memory (PCM), stacked on each HBF
+stack within its footprint (\SI{43.4}{\gibi\byte} per GPU), can absorb that
+write stream.
 
-We add a \SI{43.4}{\gibi\byte}-per-GPU phase-change memory (PCM) tier,
-physically stackable on top of each HBF stack within its existing footprint, and
-evaluate it in a discrete-event LLM serving simulator against the Mooncake
-FAST'25 traces on an 8-GPU LLaMA2-70B-GQA cluster. At the buildable capacity, a
-write-back admission policy cuts flash write volume by \SI{51.2}{\percent}
-(conversational) and \SI{52.6}{\percent} (tool/agent); adding a read-gated
-demotion policy reaches \SI{98.8}{\percent} and \SI{98.3}{\percent}, a
-$90.3\times$ and $86.4\times$ work-normalized lifetime improvement.
-
-Three results temper this. First, flash wear is governed by tier capacity
-against workload footprint, \emph{not} by batch size: across a $12\times$
-concurrency range driving peak HBM occupancy from \SI{25}{\percent} to
-\SI{99.2}{\percent}, flash bytes per request move by under
-\SI{1.1}{\percent}. Second, \SI{43.4}{\gibi\byte} per GPU sits at
-\SIrange{5.3}{10.2}{\percent} of the workload footprint, on the flat foot of the
-capacity curve; the knee at which flash goes fully read-only is $19\times$
-further out. Third, the read-gated policy buys its write reduction at a
-\SIrange{9.6}{40.7}{\percent} cost in prefix-cache hit rate. We additionally
-report a pre-registered falsification test of the central mechanism, which the
-architecture passes.
+We simulate an 8-GPU LLaMA2-70B-GQA cluster replaying the full Mooncake FAST'25
+traces in a discrete-event simulator, and keep three claims separate.
+\emph{First, an identity:} removing the baseline's write-through copy halves
+flash writes (\SI{50.2}{\percent}), regardless of flash capacity. This is a
+structural cost of the baseline, not an effect of the PCM medium.
+\emph{Second, an argument we do not measure:} the staging tier should be
+non-volatile because, under write-back, acknowledged data lives only there.
+\emph{Third, our contribution:} read-gated demotion, which sends a block to
+flash only if PCM actually served it. It removes \SIrange{98.7}{99.0}{\percent}
+of the remaining flash writes (at least \SI{99.33}{\percent} against the
+baseline). The price is reuse: measured against a no-store control, it keeps
+only \SIrange{9}{15}{\percent} of the store's reuse benefit. We price its PCM
+wear as endurance thresholds. Read-gating outlasts write-back alone above about
+$2.4\times10^{5}$ PCM cycles, and gains nothing further above
+\numrange{1.8e7}{2.5e7}. No endurance figure is published for the PCM
+generation whose density we use, so we report thresholds rather than a
+verdict. We also list the corrections to earlier versions of this work and what
+we do not claim.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -86,8 +86,9 @@ endurance, memory hierarchy.
 The key--value (KV) cache of a transformer dominates the memory budget of
 large-language-model (LLM) serving. At LLaMA2-70B with grouped-query attention,
 tensor-parallel degree two, and FP16 precision, a single token costs
-\SI{163840}{\byte} of KV state; a \num{13000}-token prompt therefore occupies
-roughly \SI{2}{\gibi\byte} before a single token is generated. HBM capacity, not
+\SI{163840}{\byte} of KV state per tensor-parallel shard; a \num{13000}-token
+prompt therefore occupies roughly \SI{2}{\gibi\byte} per shard before a single
+token is generated. HBM capacity, not
 compute, is what bounds concurrency.
 
 High-Bandwidth Flash (HBF) is a recent response: a NAND stack built to HBM-like
@@ -100,34 +101,32 @@ argues on that basis that NAND's limited write endurance is not a disadvantage.
 
 That argument does not survive contact with general serving. When the flash tier
 backs a KV store that absorbs spill from HBM, it receives a sustained write
-stream, and TLC NAND rated at \num{3000} program/erase cycles becomes the
-limiting component of the package. This paper asks whether inserting a small
-amount of \emph{bit-alterable} non-volatile memory---phase-change memory---between
-HBM and HBF absorbs enough of that stream to make the hierarchy viable, and at
-what cost.
+stream, and TLC NAND rated at \num{3000} program/erase cycles must absorb it.
+This paper asks how much of that stream a small \emph{bit-alterable}
+non-volatile tier---phase-change memory---between HBM and HBF can absorb, what
+it costs in reuse, and what PCM endurance it requires.
 
 \paragraph{Contributions}
 \begin{itemize}
-  \item A concrete PCM tier sized from the first-generation 3D XPoint density
-        of \SI{0.62}{\giga\bit\per\milli\meter\squared}
-        reported by Ehrmann \emph{et al.}~\cite{ehrmann2022pcm}
-        (\SI{43.4}{\gibi\byte} per GPU) that stacks vertically on the existing
-        HBF stacks and consumes no HBF capacity (\S\ref{sec:arch}).
-  \item A measurement of what write-absorption policy buys at that capacity:
-        \SIrange{51}{53}{\percent} write reduction from write-back admission
-        alone, and \SIrange{98}{99}{\percent} with read-gated demotion
-        (\S\ref{sec:headline}).
-  \item The negative result that flash wear is invariant to batch size and HBM
-        occupancy, which removes an entire class of proposed deployment rules
-        (\S\ref{sec:batch}).
-  \item A capacity sweep locating the knee at $19\times$ the buildable budget,
-        establishing that the design point is defensible as \emph{buildable} but
-        is not a capacity optimum (\S\ref{sec:capacity}).
-  \item A pre-registered falsification test of the mechanism by which HBM
-        pressure is assumed to reach the flash tier (\S\ref{sec:falsifier}).
-  \item An explicit statement of what the measurements do \emph{not} cover
-        (\S\ref{sec:limits}), including the fact that generated KV is bounded at
-        \SIrange{1.9}{2.8}{\percent} of tokens on these traces.
+  \item A PCM staging tier sized from the sourced first-generation 3D XPoint
+        density of \SI{0.62}{\giga\bit\per\milli\meter\squared}~\cite{ehrmann2022pcm}
+        (\SI{43.4}{\gibi\byte} per GPU), placed on the HBF stacks within their
+        footprint (\S\ref{sec:arch}).
+  \item A store model in which PCM is a true level of the hierarchy: spill-only
+        entry, lookup beyond the HBM hit, and read credit only on an actual PCM
+        serve. We also report how each simpler alternative fails
+        (\S\ref{sec:storemodel}).
+  \item A measurement of the baseline's structural cost: write-through spends
+        one extra flash write per admitted block, and removing it halves flash
+        writes regardless of flash capacity. We present this as characterising
+        the baseline, not as a contribution of PCM (\S\ref{sec:identity}).
+  \item Read-gated demotion: about \SI{99}{\percent} of the remaining flash
+        writes removed, at the cost of most of the store's reuse benefit,
+        measured against a no-store control (\S\ref{sec:headline}).
+  \item PCM wear priced as endurance thresholds over a swept axis, with every
+        assumption stated (\S\ref{sec:endurance}).
+  \item The corrections to earlier versions of this work, and an explicit
+        statement of what is not claimed (\S\ref{sec:limits}).
 \end{itemize}
 
 %==============================================================================
@@ -140,8 +139,9 @@ vLLM's paged attention~\cite{vllm} manages HBM in fixed-size blocks and reuses
 shared prefixes across requests; Mooncake~\cite{mooncake} extends this to a
 disaggregated store with a DRAM memory tier and an SSD offload tier, admitting
 blocks on prefill and evicting by LRU. The economics are attractive because
-prompts are heavily shared: on the traces used here, \num{4080885} prompt-block
-instances deduplicate to \num{2695220} distinct blocks, a $1.51\times$ factor.
+prompts are heavily shared: in the first \num{5000} conversational requests of
+the traces used here, \num{4080885} prompt-block instances deduplicate to
+\num{2695220} distinct blocks, a $1.51\times$ factor.
 
 \subsection{H3: HBM plus high-bandwidth flash}
 H3~\cite{h3} assumes a B200-class GPU with \SI{192}{\giga\byte} of HBM3e across
@@ -166,18 +166,19 @@ bandwidth. Two structural points are often modelled incorrectly and matter here:
 
 \subsection{Why endurance becomes the problem}
 H3 targets read-only data and argues that low write endurance is therefore not a
-disadvantage. We target \emph{generated and transient} KV on the same hardware.
-Under that workload HBF receives the spill stream from a KV store, and TLC NAND
-at \num{3000} P/E cycles must absorb it. Taking the cluster flash budget of
-\SI{24}{\tebi\byte} at \num{3000} P/E and assuming a write-amplification factor
-of one with ideal wear levelling gives
-$24 \times 2^{40} \times 3000 = \SI{7.92e16}{\byte}$ of lifetime writes---a
-figure we use only as a \emph{ratio} denominator, never to quote a lifetime in
-days, because the far tier has no shared-bandwidth model in this work.
+disadvantage. We target KV blocks that HBM spills on the same hardware. Under
+that workload HBF receives a sustained write stream, and TLC NAND at \num{3000}
+P/E cycles must absorb it. With ideal wear levelling and a write-amplification
+factor of one, each GPU's \SI{3}{\tebi\byte} admits about
+$\SI{9.9e15}{\byte}$ of writes over its life. We use this figure only within
+ratios and thresholds, never to quote a lifetime in days, because the far tier
+has no shared-bandwidth model here.
 
-PCM is the natural absorber: it is bit-alterable, so it does not pay NAND's
-erase-block penalty, and its write endurance is orders of magnitude higher.
-Its cost per bit and its exact endurance figure are the open variables.
+PCM is a natural staging tier. It is non-volatile and bit-alterable, so it does
+not pay NAND's erase-block penalty. Its endurance, however, varies by orders of
+magnitude across devices, and no figure is published for the generation whose
+density we use (\S\ref{sec:endurance}). We therefore treat PCM endurance as an
+open axis.
 
 %==============================================================================
 \section{Architecture}\label{sec:arch}
@@ -185,20 +186,21 @@ Its cost per bit and its exact endurance figure are the open variables.
 
 \begin{table}[t]
 \centering
-\caption{Per-GPU memory hierarchy. HBM and HBF figures follow
-H3~\cite{h3} for a B200-class part; the PCM tier is this work's addition.}
+\caption{Per-GPU memory hierarchy. HBM and HBF follow H3~\cite{h3} for a
+B200-class part; the PCM tier is this work's addition. Units are binary
+throughout.}
 \label{tab:hierarchy}
 \small
 \begin{tabular}{llll}
 \toprule
 \textbf{Tier} & \textbf{Capacity} & \textbf{Bandwidth} & \textbf{Role} \\
 \midrule
-HBM3e & \SI{192}{\giga\byte} & \SI{8}{\tera\byte\per\second} & memory tier \\
-      & 8 cubes $\times$ \SI{24}{\giga\byte} & \SI{1}{\tera\byte\per\second}/cube & \emph{all} KV \\[2pt]
-PCM   & \textbf{\SI{43.4}{\gibi\byte}} & --- & write absorber \\
+HBM3e & \SI{192}{\gibi\byte} & \SI{8}{\tera\byte\per\second} & GPU KV cache \\
+      & 8 cubes $\times$ \SI{24}{\gibi\byte} & & (\emph{all} KV) \\[2pt]
+PCM   & \textbf{\SI{43.4}{\gibi\byte}} & assumed & staging tier \\
       & 8 stacks $\times$ \SI{5.43}{\gibi\byte} & & \\[2pt]
-HBF   & \SI{3}{\tera\byte} & \SI{8}{\tera\byte\per\second} & offload tier \\
-      & 8 stacks $\times$ \SI{384}{\giga\byte} & & \\
+HBF   & \SI{3}{\tebi\byte} & \SI{8}{\tera\byte\per\second} & flash tier \\
+      & 8 stacks $\times$ \SI{384}{\gibi\byte} & & \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -214,47 +216,56 @@ first-generation 3D XPoint density of
                         &= \SI{5.43}{\gibi\byte} \text{ per stack} \nonumber\\
 8 \times \SI{5.43}{\gibi\byte} &= \mathbf{\SI{43.4}{\gibi\byte}} \text{ per GPU.}
 \end{align}
-For comparison, the NAND side is TLC at
-\SI{29}{\giga\bit\per\milli\meter\squared}, so a \SI{1}{\tera\bit} die occupies
-roughly \SI{35.3}{\milli\meter\squared} and holds \SI{128}{\gibi\byte}. The PCM
-tier is thus about \SI{1.4}{\percent} of the flash capacity it protects.
+The \SI{35}{\milli\meter\squared} die is the area of a \SI{1}{\tebi\bit} TLC
+die at \SI{29}{\giga\bit\per\milli\meter\squared}; that density is uncited, so
+the die area is an open parameter (\S\ref{sec:limits}). The PCM tier is about
+\SI{1.4}{\percent} of the flash capacity it sits on.
 
-\subsection{Write-absorption policies}
-The store exposes two orthogonal policy knobs, giving the three configurations
-evaluated throughout (Table~\ref{tab:configs}):
+\subsection{Data path}
+A KV block enters the staging tier \emph{only when HBM evicts it} (spill). A
+later request reads a stored block from PCM or from HBF directly into HBM; a
+block served from HBF is \emph{not} re-admitted to PCM. When PCM is full, its
+least-recently-used victim is either demoted to HBF or dropped, according to
+the demotion policy.
+
+\subsection{Write policies and the three configurations}
+Two policy knobs define the configurations evaluated throughout
+(Table~\ref{tab:configs}).
 
 \begin{itemize}
   \item \textbf{Admission write policy.} Under \emph{write-through}, every
-        admission to the memory tier immediately writes the block through to
-        flash; a later demotion is then a byte-identical duplicate, and no
-        eviction-time policy can remove more than that duplicate half. Under
-        \emph{write-back}, admission spends no flash write at all, and a block
-        reaches flash only if demotion later decides to send it.
-  \item \textbf{Demotion policy.} Under \emph{always}, every memory-tier
-        eviction demotes its victim. Under \emph{if\_read}, only victims that
-        were read back at least once while resident are demoted; never-read
-        victims are dropped, on the grounds that the bytes bought no cache hit.
+        admission to the staging tier also writes the block to flash at once;
+        the demotion that follows is a second, byte-identical write. Under
+        \emph{write-back}, admission writes only the staging tier, and a block
+        reaches flash only if it is demoted.
+  \item \textbf{Demotion policy.} Under \emph{always}, every staging-tier
+        eviction demotes its victim. Under \emph{if\_read}, a victim is demoted
+        only if PCM actually served it at least once while resident; otherwise
+        it is dropped.
 \end{itemize}
 
 \begin{table}[t]
 \centering
-\caption{Evaluated configurations.}
+\caption{Evaluated configurations. All three use the same
+\num{71104}-block staging pool (\SI{43.4}{\gibi\byte} per writing GPU).}
 \label{tab:configs}
 \small
 \begin{tabular}{llll}
 \toprule
- & \textbf{Memory tier} & \textbf{Admission} & \textbf{Demotion} \\
+ & \textbf{Staging tier} & \textbf{Admission} & \textbf{Demotion} \\
 \midrule
-\cfgb\ HBF only      & DRAM & write-through & always \\
-\cfgc\ +PCM          & PCM  & write-back    & always \\
-\cfgd\ +PCM, gated   & PCM  & write-back    & if\_read \\
+\cfgb\ baseline       & DRAM & write-through & always \\
+\cfgc\ write-back     & PCM  & write-back    & always \\
+\cfgd\ read-gated     & PCM  & write-back    & if\_read \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Configuration \cfgb\ is the HBF-only baseline: it is what the H3 hierarchy does
-if a KV store is simply pointed at it. Writing it this way makes the comparison
-a policy comparison at fixed hardware, which is the honest form of the question.
+Configuration \cfgb\ is \emph{not} an ``HBF-only'' system. It is a write-through
+DRAM buffer of the same size in front of HBF, and that buffer serves
+\SI{6.9}{\percent} (conversational) and \SI{7.2}{\percent} (tool/agent) of
+\cfgb's store-served tokens. Holding the buffer size fixed makes every
+comparison a policy comparison on the same hardware.
 
 %==============================================================================
 \section{Methodology}\label{sec:method}
@@ -262,401 +273,682 @@ a policy comparison at fixed hardware, which is the honest form of the question.
 
 \subsection{Simulator}
 We extend TokenSim~\cite{tokensim}, a discrete-event simulator for LLM inference
-systems that models request arrival, prefill/decode scheduling, paged KV
-management, distributed execution and roofline-derived latency. Its Mooncake
-store is modelled as a memory tier plus an offload tier with LRU eviction and a
-per-operation latency function
-$t = t_\text{fixed} + \text{bytes} / \text{BW}$.
+that models request arrival, prefill/decode scheduling, paged KV management and
+distributed execution. Its Mooncake store~\cite{mooncake} has a memory tier
+(our staging tier) and an offload tier (HBF), each with LRU eviction and a
+per-operation latency $t = t_\text{fixed} + \text{bytes}/\text{BW}$; bandwidth
+is not shared between operations. Write volume is counted exactly, in blocks
+and bytes, per tier. Every behaviour we add sits behind a configuration flag
+whose default is the stock behaviour, and with all flags at their defaults the
+output is byte-identical to the unmodified simulator.
 
-The latency hiding buffer is not simulated as a buffer; its effect is folded
-into the flash read parameters as \SI{0.1}{\micro\second} fixed latency at
-\SI{8}{\tera\byte\per\second}. This is a \emph{perfect-prefetch upper bound},
-not a measurement, and it is deliberately generous to the HBF-only baseline---it
-makes flash reads cheap, which is conservative for the argument we are making.
-Flash writes are NAND-realistic at \SI{200}{\micro\second} and
-\SI{3}{\giga\byte\per\second} and are \emph{not} hidden, since the buffer is a
-read-side prefetcher.
+\textbf{Timing.} Flash reads use \SI{0.1}{\micro\second} at
+\SI{8}{\tera\byte\per\second}: H3's latency-hiding buffer folded in as a
+\emph{perfect-prefetch upper bound}, which flatters the baseline. Flash writes
+use \SI{200}{\micro\second} and \SI{3.0}{\gibi\byte\per\second}, TokenSim's
+stock SSD default, which is \emph{unsourced}. PCM timing
+(\num{0.1}/\SI{1.0}{\micro\second} read/write,
+\num{100}/\SI{20}{\gibi\byte\per\second}) is \emph{assumed}. Our results are
+byte counts; timing only shapes the schedule. Removing all store time, or
+scaling PCM write timing by $0.25\times$ and $4\times$, moved the baseline's
+flash stream and every PCM stream by at most \SI{0.54}{\percent}. That test ran
+under the earlier copy-at-admission model and has not been repeated under the
+configuration used here.
 
 \subsection{Platform and capacity bookkeeping}
-The cluster is eight B200-class workers running LLaMA2-70B-GQA
+The cluster is eight B200-class GPUs running LLaMA2-70B-GQA
 ($N_\text{head}=64$, 8 KV heads, $N_\text{layer}=80$, $d_\text{model}=8192$) at
-tensor-parallel degree 2 and data-parallel degree 4. KV precision is FP16, which
-is hardcoded in the harness; FP8 would halve KV bytes per token and improve every
-write-volume result, so FP16 \emph{understates} the benefit.
+tensor-parallel degree 2 and data-parallel degree 4. Tensor parallelism splits
+the KV heads, giving 4 heads per shard and
+$4 \times 128 \times 2 \times \SI{2}{\byte} \times 80 = \SI{163840}{\byte}$
+per token per shard; a 16-token block is \SI{2621440}{\byte}. KV precision is
+FP16 and hardcoded in the harness. FP8 would halve every byte count, so FP16
+understates the benefit.
 
-This gives \SI{163840}{\byte} per token and a \num{16}-token block of
-\SI{2621440}{\byte}. The store is a single cluster-wide pool, so capacities are
-cluster totals:
+Only the tensor-rank-0 worker of each data-parallel group is scheduled; the
+rank-1 shard's stream is an exact mirror and is not simulated. Four GPUs
+therefore write to the store, every byte figure is \emph{per tensor-parallel
+shard}, and batch is quoted per active scheduler. Ratios and reductions are
+unaffected. Pools are sized for the four writing GPUs and split into private
+per-GPU partitions, because PCM is in-package on each GPU's own HBF stacks:
 \begin{align}
-\text{PCM pool} &= \SI{43.4}{\gibi\byte} \times 8 = \SI{347.2}{\gibi\byte} = \num{142213}~\text{blk} \nonumber\\
-\text{HBF pool} &= \SI{3}{\tebi\byte} \times 8 = \SI{24}{\tebi\byte} = \num{10066329}~\text{blk} \nonumber\\
-\text{HBM/rank} &= \SI{192}{\gibi\byte} = \num{78643}~\text{blk.} \nonumber
+\text{PCM} &= 4 \times \num{17776}~\text{blk} = 4 \times \SI{43.4}{\gibi\byte} \nonumber\\
+\text{HBF} &= 4 \times \num{1258291}~\text{blk} = 4 \times \SI{3}{\tebi\byte} \nonumber\\
+\text{HBM} &= \num{78643}~\text{blk} = \SI{192}{\gibi\byte} \text{ per GPU.} \nonumber
 \end{align}
+The per-GPU split is enforced in the store and recorded in every result. Because
+TokenSim subtracts model weights from HBM while H3 keeps them in HBF, the HBM
+capacity is pre-compensated by the weight size so that exactly
+\SI{192}{\gibi\byte} remains for KV.
 
-\subsection{Workload}
-We use the Mooncake FAST'25 conversational and tool/agent
-traces~\cite{mooncake}, first \num{5000} requests each, replayed at an offered
-load of \SI{30}{\per\second}. Table~\ref{tab:workload} gives the footprints.
-These traces are a \textbf{stand-in}: the target workload is cache-augmented
-generation, whose parameters are not yet fixed, and every result should be read
-with that substitution in mind.
+\subsection{Store model}\label{sec:storemodel}
+The store implements the data path of \S\ref{sec:arch} with four settings:
+\begin{itemize}
+  \item \textbf{spill-only entry}: a block is written to the store only when
+        HBM evicts it;
+  \item \textbf{lookup after the HBM hit}: a new request asks the store only
+        for blocks beyond those already in HBM, as in vLLM's KV-connector
+        interface;
+  \item \textbf{read credit on serve}: \emph{if\_read} credits a block only
+        when PCM actually serves it;
+  \item \textbf{load the missing span}: only blocks not hit in HBM are loaded.
+\end{itemize}
+Capacity and partitioning were chosen on hardware grounds; these four were
+chosen on modelling grounds. This is the only combination we found in which
+the store behaves as a hierarchy and PCM serves real reads. Each alternative
+fails measurably:
+\begin{itemize}
+  \item copying every prompt block into the store at admission (the stock
+        behaviour) makes HBM and the store parallel copies, and PCM never served
+        a read in 332 such runs;
+  \item spill-only entry with a lookup that starts at block~0 serves 0 and 769
+        of \num{5000} lookups, because the prompt head stays in HBM and the walk
+        stops at the first absent key;
+  \item crediting every block a lookup \emph{walks} opens the \emph{if\_read}
+        gate with no PCM read at all (\S\ref{sec:corrections}).
+\end{itemize}
+
+\subsection{Workload and replicates}
+We replay the full Mooncake FAST'25 conversational (\num{12031} requests) and
+tool/agent (\num{23608} requests) traces~\cite{mooncake} at
+30~requests/s, with at most 48 concurrent requests per
+scheduler. These traces are a \textbf{stand-in}: the target workload is
+cache-augmented generation, whose corpus size, sharing factor and transient
+volume are not yet fixed. The store holds prompt blocks only; generated tokens
+are \SI{2.58}{\percent} and \SI{1.94}{\percent} of all tokens. The traces hash
+prompts in 512-token chunks against the simulator's 16-token blocks, so a
+continuation cannot reuse its predecessor's partial tail and reported hit rates
+are floors.
+
+\cfgb\ and \cfgc\ are single runs; their flash streams move by at most
+\SI{0.5}{\percent} under perturbation. \cfgd\ is reported as a range over
+$N=4$ runs per trace: the unjittered replay plus three seeds of
+\emph{burst-level} arrival jitter, which shifts each arrival burst by up to
+$0.05\times$ the minimum inter-burst gap (\SI{16.989}{\milli\second} and
+\SI{33.338}{\milli\second}) and rejects any run whose arrival order changes. The
+simulator's random seed has no effect on these traces, so it cannot produce
+replicates.
+
+\subsection{Metrics and verification}
+The primary metric is flash write bytes per request (B/req), per
+tensor-parallel shard. All results are work-normalized; we quote no latency,
+throughput or lifetime in days (\S\ref{sec:notclaimed}). Alongside it we report:
+\begin{itemize}
+  \item the \emph{residue-adjusted} reduction, which charges keyed blocks still
+        in HBM at the end of the run (never spilled) as if eventually demoted;
+  \item prefix-cache hit rate, and a \emph{no-store control} (the same run with
+        the store disabled), from which the share of the store's reuse benefit
+        each configuration keeps is
+        $(h - h_\text{none}) / (h_{\cfgb} - h_\text{none})$;
+  \item the share of store-served tokens served from PCM;
+  \item every PCM write tagged by source: first-time, re-admission after an
+        \emph{if\_read} drop, or re-admission after an HBF eviction.
+\end{itemize}
+Every campaign is gated on reproducing a previously recorded table to the last
+digit. Instrumentation counters are verified to change no other output. In
+every \cfgb/\cfgc\ run the write identities
+$\text{HBF}_{\cfgb} = \text{admissions} + \text{demotions}$ and
+$\text{HBF}_{\cfgc} = \text{demotions}$ hold exactly. Expected outcomes are
+written down before the runs, and a failed expectation is reported as failed.
+
+%==============================================================================
+\section{Evaluation}\label{sec:eval}
+%==============================================================================
+Every result is from the full traces in the configuration of
+\S\ref{sec:storemodel}, quoted as \emph{conversational\,/\,tool-agent}. The
+claim has three parts, which we keep separate on purpose:
+\begin{enumerate}
+  \item removing write-through halves flash writes: \textbf{measured}, but an
+        \textbf{identity} that characterises the baseline (\S\ref{sec:identity});
+  \item the staging tier should be non-volatile and in-package:
+        \textbf{argued, not measured} (\S\ref{sec:argued});
+  \item read-gated demotion: \textbf{measured and non-trivial}, the
+        contribution (\S\ref{sec:headline}), with its PCM endurance cost priced
+        as a threshold (\S\ref{sec:endurance}).
+\end{enumerate}
+A same-capacity volatile buffer would write identical flash bytes. The case for
+PCM rests on durability and in-package placement, not on write volume.
+
+%------------------------------------------------------------------------------
+\subsection{The baseline's structural write cost (an identity)}\label{sec:identity}
+%------------------------------------------------------------------------------
+Write-through costs exactly one extra flash write per admitted block. In every
+\cfgb\ and \cfgc\ run,
+\begin{equation}
+\text{HBF}_{\cfgb} = \text{admissions} + \text{demotions},\qquad
+\text{HBF}_{\cfgc} = \text{demotions},
+\end{equation}
+exactly, and demotions differ from admissions only by the blocks still resident
+at the end. Removing the write-through copy therefore halves flash writes
+whatever the medium: in the simulator, the staging tier's medium changes timing
+only. We present this as quantifying a structural cost of the baseline, not as
+a finding about PCM.
 
 \begin{table}[t]
 \centering
-\caption{Workload footprint, $W=\num{5000}$ requests. Distinct blocks are
-counted with the store's own truncation.}
-\label{tab:workload}
+\caption{The baseline's structural cost. \emph{Unlimited} HBF is a sensitivity
+setting (no flash eviction), not a hardware value.}
+\label{tab:identity}
 \small
 \begin{tabular}{lrr}
 \toprule
- & \textbf{Conversational} & \textbf{Tool/Agent} \\
+ & \textbf{Conv.} & \textbf{Tool/agent} \\
 \midrule
-prompt-block instances & \num{4080885} & \num{2908548} \\
-\textbf{distinct blocks} & \textbf{\num{2695220}} & \textbf{\num{1397479}} \\
-as bytes & \SI{6580}{\gibi\byte} & \SI{3412}{\gibi\byte} \\
-deduplication & $1.51\times$ & $2.08\times$ \\
-input tokens, mean & \num{13066} & \num{9315} \\
-output tokens, mean & \num{346} & \num{185} \\
+HBF B/req, \cfgb & \num{3036078553} & \num{1466116938} \\
+HBF B/req, \cfgc & \num{1511160257} & \num{729379925} \\
+\cfgb$\to$\cfgc, raw & \SI{50.23}{\percent} & \SI{50.25}{\percent} \\
+\cfgb$\to$\cfgc, residue-adjusted & \SI{49.29}{\percent} & \SI{49.26}{\percent} \\
+\cfgb$\to$\cfgc, unlimited HBF, raw & \SI{50.22}{\percent} & \SI{50.25}{\percent} \\
+hit rate \cfgb\,/\,\cfgc & 0.1898\,/\,0.1898 & 0.4510\,/\,0.4511 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Metrics and reproducibility}
-All results are \textbf{work-normalized}: bytes per request, bytes per token, or
-ratios. We quote no absolute lifetimes in days, because the far tier has no
-shared-bandwidth model. Every run reports the occupancy and capacity
-\emph{achieved}, not the knob value set, and the achieved batch per scheduler is
-reported alongside, so that a configuration which changes throughput cannot
-silently change the operating point.
+Table~\ref{tab:identity} gives the numbers. The halving does not depend on
+flash capacity. We fixed the rule in advance: if \cfgb$\to$\cfgc\ under
+unlimited HBF stays within five points of the finite-HBF value, the halving is
+not driven by HBF capacity. It moves by at most \num{0.01}~points. At the design
+capacity, \cfgb\ and \cfgc\ evict 1.5--2.0~M blocks from HBF over the full
+traces, but those blocks are cold. Removing the evictions changes flash bytes by
+at most \SI{0.09}{\percent} and hit rate by at most \SI{+0.11}{\percent}.
+Write-back costs no reuse: \cfgc\ keeps about \SI{100}{\percent} of the
+store's reuse benefit.
 
-Each experimental campaign is gated on reproducing a previously recorded
-configuration to every digit before any new number is trusted. The workload
-rebuild used here reproduces twelve independently recorded values exactly---block
-instance counts, distinct-block counts, input/output length distributions, and
-five simulator outputs per trace---on the first attempt.
+%------------------------------------------------------------------------------
+\subsection{Why the staging tier should be non-volatile and in-package (argued,
+not measured)}\label{sec:argued}
+%------------------------------------------------------------------------------
+\textbf{The simulator does not support this subsection.} It rests on
+write-back semantics and on placement, not on byte counts.
 
-%==============================================================================
-\section{Evaluation}
-%==============================================================================
+\emph{Durability is the primary argument.} Under write-back, an acknowledged
+block lives only in the staging tier until it is demoted. A volatile buffer in
+that role would lose acknowledged data on power failure; a non-volatile one
+would not. This needs no density figure, and the simulator cannot measure it.
+The argument is weaker for a cache than for primary storage: KV blocks can be
+recomputed, so their loss costs recomputation time and energy, not correctness.
 
-\subsection{Write absorption at the design point}\label{sec:headline}
+\emph{Placement is supporting evidence only.} At the sourced first-generation
+3D XPoint density, \SI{43.4}{\gibi\byte} per GPU fits on top of the existing
+HBF stacks, inside their footprint, and takes no NAND capacity
+(\S\ref{sec:arch}). We make no density comparison with DRAM.
 
-\begin{table}[t]
+%------------------------------------------------------------------------------
+\subsection{Read-gated demotion}\label{sec:headline}
+%------------------------------------------------------------------------------
+Configuration \cfgd\ is a \emph{selection policy}, not an identity: it demotes
+only blocks that PCM actually served. Table~\ref{tab:headline} reports it
+against \cfgb, \cfgc\ and the no-store control.
+
+\begin{table*}[t]
 \centering
-\caption{HBM-saturated operation, $W=\num{5000}$, \SI{30}{\per\second} offered,
-peak HBM occupancy \SIrange{99.1}{99.2}{\percent} in all six runs.
-\emph{B/req} is HBF write bytes per request.}
+\caption{Read-gated demotion, full traces. \cfgd\ is a range over $N=4$ runs
+(unjittered + three burst-jitter seeds). B/req is per tensor-parallel shard;
+batch is per active scheduler.}
 \label{tab:headline}
 \small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
-\textbf{Conversational} & \cfgb & \cfgc & \cfgd \\
+ & \multicolumn{3}{c}{\textbf{Conversational}} & \multicolumn{3}{c}{\textbf{Tool/agent}} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & \cfgb & \cfgc & \cfgd & \cfgb & \cfgc & \cfgd \\
 \midrule
-HBF write blocks      & \num{6461439} & \num{3150432} & \textbf{\num{80968}} \\
-HBF B/req ($\times 10^9$) & 3.388 & 1.652 & \textbf{0.042} \\
-blocks demoted / dropped & \num{3159613} / 0 & \num{3150432} / 0 & \num{80968} / \num{3563313} \\
-prefix hit rate       & 0.1631 & 0.1641 & 0.0942 \\
-achieved batch/sched  & 43.61 & 42.90 & 41.55 \\
-\textbf{write reduction vs \cfgb} & --- & \textbf{\SI{51.24}{\percent}} & \textbf{\SI{98.75}{\percent}} \\
-\midrule
-\textbf{Tool/Agent} & \cfgb & \cfgc & \cfgd \\
-\midrule
-HBF write blocks      & \num{3234691} & \num{1534945} & \textbf{\num{55703}} \\
-HBF B/req ($\times 10^9$) & 1.696 & 0.805 & \textbf{0.029} \\
-blocks demoted / dropped & \num{1546239} / 0 & \num{1534945} / 0 & \num{55703} / \num{1694505} \\
-prefix hit rate       & 0.4014 & 0.4033 & 0.3733 \\
-achieved batch/sched  & 48.44 & 47.32 & 44.72 \\
-\textbf{write reduction vs \cfgb} & --- & \textbf{\SI{52.55}{\percent}} & \textbf{\SI{98.28}{\percent}} \\
+HBF B/req ($\times10^{6}$) & 3036 & 1511 & \textbf{14.6--16.6} & 1466 & 729 & \textbf{9.3--9.8} \\
+reduction vs \cfgb & --- & \SI{50.2}{\percent} & \textbf{99.45--99.52\,\%} & --- & \SI{50.3}{\percent} & \textbf{99.33--99.36\,\%} \\
+PCM B/req ($\times10^{9}$) & 1.526 & 1.527 & 1.703--1.706 & 0.737 & 0.737 & 0.815--0.816 \\
+hit rate (no store: 0.0916\,/\,0.3870) & 0.1898 & 0.1898 & 0.1006--0.1019 & 0.4510 & 0.4511 & 0.3959--0.3966 \\
+store benefit kept & --- & ${\approx}$\SI{100}{\percent} & \textbf{9.2--10.5\,\%} & --- & ${\approx}$\SI{100}{\percent} & \textbf{13.9--15.1\,\%} \\
+store-served tokens from PCM & \SI{6.9}{\percent} & \SI{6.3}{\percent} & 72.6--76.5\,\% & \SI{7.2}{\percent} & \SI{6.6}{\percent} & 71.3--73.9\,\% \\
+HBF bytes per reuse-hit block & 21.3\,M & 10.6\,M & 193--217\,k & 6.06\,M & 3.01\,M & 44--46\,k \\
+batch per active scheduler & 47.09 & 47.11 & 46.78--46.81 & 45.63 & 45.44 & 44.69--44.78 \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
-Table~\ref{tab:headline} gives the headline. Moving admission from write-through
-to write-back---configuration \cfgb\ to \cfgc---halves flash write volume, and it
-does so for a structural reason: under write-through every admission already
-spent a flash write, so the demotion that follows is a byte-identical duplicate.
-Write-back removes that duplicate half exactly. The residual is the genuine
-spill.
+\textbf{Writes.} \cfgd\ writes 0.97--1.10\,\% (conversational) and
+1.28--1.34\,\% (tool/agent) of \cfgc's flash bytes, dropping
+\SIrange{98.7}{99.0}{\percent} of what write-back alone still writes. Against
+\cfgb\ the worst-case reduction over the four runs is \SI{99.45}{\percent} and
+\SI{99.33}{\percent}.
 
-Adding read-gated demotion (\cfgd) removes almost all of what remains, reaching
-\SI{98.75}{\percent} and \SI{98.28}{\percent} reduction. Expressed as
-work-normalized lifetime against the flash endurance budget, that is
-$\mathbf{90.3\times}$ and $\mathbf{86.4\times}$ more requests served before
-wear-out. Generated token counts are identical across configurations within each
-trace, so the per-request and per-token multipliers coincide exactly.
+\textbf{Reuse.} \cfgd\ keeps 53.0--53.7\,\% and 87.8--88.0\,\% of \cfgb's
+reuse-hit blocks. That figure must be read against the no-store control:
+\emph{with no store at all}, the system keeps \SI{48.3}{\percent} and
+\SI{85.8}{\percent}, because most reuse is served from HBM. \cfgd\ therefore
+keeps only 9.2--10.5\,\% and 13.9--15.1\,\% of the reuse the store adds; its hit
+rate is 9.8--11.2\,\% and 2.3--2.5\,\% above no store.
 
-Achieved batch is matched to within \SI{4.7}{\percent} and \SI{7.7}{\percent}
-across the three configurations, preemption and recomputation counts are zero
-throughout, and the conservation identity
-$\text{demoted} + \text{dropped} = \text{memory evictions}$ holds in every run.
+\textbf{PCM does the serving.} PCM serves 71--77\,\% of \cfgd's store-served
+tokens, against 6--7\,\% in \cfgb\ and \cfgc. Every \cfgd\ demotion had a real
+PCM-served read (eight runs, difference zero).
 
-\subsection{Wear is invariant to concurrency}\label{sec:batch}
+\textbf{Where \cfgd's PCM writes come from.} Tagging every PCM write gives
+89.5--89.7\,\% and 90.2--90.3\,\% first-time admissions and 10.3--10.5\,\% and
+9.7--9.8\,\% re-admissions of blocks that \emph{if\_read} had dropped, with
+none after an HBF eviction. Those re-admissions account for 99.6--99.9\,\%
+(conversational) and 101.2--101.5\,\% (tool/agent) of the block difference
+between \cfgd's and \cfgc's PCM writes. \cfgd\ writes 11.5--11.7\,\% and
+10.6--10.7\,\% more to PCM than \cfgc, and that extra is the cost of re-taking
+dropped blocks.
 
-A natural deployment rule would be ``below concurrency $N$, the flash tier stays
-effectively read-only.'' It does not exist. Table~\ref{tab:batch} sweeps the
-per-scheduler concurrency cap over a $12\times$ range.
+\textbf{Reading.} \cfgd\ is the aggressive end of a write/reuse trade-off. It
+removes about \SI{99}{\percent} of the flash write stream, keeps a tenth to a
+seventh of what the store adds over no store, and carries the reuse it keeps in
+PCM. It is not a free improvement.
+
+%------------------------------------------------------------------------------
+\subsection{Pricing PCM wear: break-even endurance}\label{sec:endurance}
+%------------------------------------------------------------------------------
+\cfgd\ moves writes from flash to PCM, so its value depends on PCM endurance.
+No endurance figure exists for the PCM generation whose density we use
+(Table~\ref{tab:literature}), so we treat endurance as an axis, not a constant.
+A tier wears out after
+$\text{capacity} \times \text{endurance} / \text{B/req}$ requests, and the
+system at its first tier. Per writing GPU, HBF is
+$\num{1258291} \times \SI{2621440}{\byte}$ at \num{3000} P/E and PCM is
+$\num{17776} \times \SI{2621440}{\byte}$. Both capacities must be on the same
+basis; mixing a pooled HBF capacity with a per-GPU PCM capacity is a $4\times$
+error. The \cfgb\ buffer is DRAM and never wears out.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=\columnwidth, height=0.62\columnwidth,
+  xlabel={assumed PCM endurance (cycles)},
+  ylabel={requests to first wear-out, $\div$ \cfgb},
+  xmin=1e5, xmax=1e12, ymin=0.5, ymax=400,
+  legend pos=north west, legend style={font=\scriptsize},
+  tick label style={font=\scriptsize}, label style={font=\small}]
+\addplot[thick, blue] coordinates {(1e5,0.838) (2.177e7,182.4) (1e12,182.4)};
+\addlegendentry{\cfgd, conversational}
+\addplot[thick, blue, dashed] coordinates {(1e5,0.846) (1.774e7,150.1) (1e12,150.1)};
+\addlegendentry{\cfgd, tool/agent}
+\addplot[thick, red] coordinates {(1e5,0.936) (2.145e5,2.009) (1e12,2.009)};
+\addlegendentry{\cfgc, conversational}
+\addplot[thick, red, dashed] coordinates {(1e5,0.936) (2.147e5,2.010) (1e12,2.010)};
+\addlegendentry{\cfgc, tool/agent}
+\addplot[gray, densely dotted] coordinates {(1e5,1) (1e12,1)};
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{System lifetime against assumed PCM endurance, relative to the
+\cfgb\ baseline (dotted line), which is HBF-limited at every endurance. \cfgd\
+is the worst case over $N=4$. Each curve rises while PCM wears out first and
+flattens once HBF does.}
+\label{fig:sweep}
+\end{figure}
 
 \begin{table}[t]
 \centering
-\caption{Concurrency sweep, configuration \cfgb, conversational trace.
-HBF bytes per request are flat.}
-\label{tab:batch}
+\caption{PCM endurance thresholds (cycles), full traces. \cfgd\ ranges are over
+$N=4$.}
+\label{tab:thresholds}
 \small
-\begin{tabular}{rrrr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{cap} & \textbf{achieved batch} & \textbf{peak HBM} & \textbf{HBF B/req} \\
+ & \textbf{Conv.} & \textbf{Tool/agent} \\
 \midrule
-8   & 3.94  & \SI{25.0}{\percent} & \num{3377115693} \\
-16  & 7.83  & \SI{39.8}{\percent} & \num{3370987815} \\
-32  & 15.46 & \SI{62.1}{\percent} & \num{3383093625} \\
-48  & 23.17 & \SI{85.7}{\percent} & \num{3370675339} \\
-64  & 30.81 & \SI{99.0}{\percent} & \num{3376704651} \\
-96  & 42.16 & \SI{99.1}{\percent} & \num{3385003082} \\
-192 & 43.61 & \SI{99.2}{\percent} & \num{3387654930} \\
-256 & 43.61 & \SI{99.2}{\percent} & \num{3387654930} \\
-\midrule
-\multicolumn{3}{l}{\textbf{spread}} & \textbf{\SI{0.50}{\percent}} \\
+\cfgd\ outlives \cfgb & \num{1.19e5} & \num{1.18e5} \\
+\textbf{\cfgd\ outlives \cfgc\ (net-positive)} & $\mathbf{2.39\text{--}2.40\times10^{5}}$ & $\mathbf{2.37\text{--}2.38\times10^{5}}$ \\
+break-even, \cfgc & \num{214535} & \num{214657} \\
+break-even, \cfgd & $2.17\text{--}2.48\times10^{7}$ & $1.77\text{--}1.86\times10^{7}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Over a $12\times$ concurrency range that drives peak HBM occupancy from
-\SI{25}{\percent} to \SI{99.2}{\percent}, flash bytes per request move by
-\SI{0.50}{\percent} (conversational) and \SI{1.10}{\percent} (tool/agent)---noise,
-and not even monotone. The PCM multiplier is flat at $2.05\times$ and
-$2.09\times$ at every point.
+Figure~\ref{fig:sweep} and Table~\ref{tab:thresholds} give the result. Two
+thresholds mean different things.
+\begin{itemize}
+  \item \textbf{Net-positive.} Above about $2.4\times10^{5}$ cycles, \cfgd\
+        outlasts \cfgc. Below it, \cfgd's extra PCM writes wear PCM out first;
+        at $10^{5}$ cycles \cfgd\ lasts 0.89--0.90$\times$ as long as \cfgc.
+  \item \textbf{Break-even.} The break-even endurance
+        $E_\text{PCM} = \tfrac{\text{HBF cap}\times3000}{\text{HBF B/req}}
+        \cdot\tfrac{\text{PCM B/req}}{\text{PCM cap}}$ is where PCM and HBF
+        exhaust their budgets together. Above it, more PCM endurance buys
+        nothing, and \cfgd's advantage plateaus at the flash write ratio,
+        $90.8$--$103.3\times$ and $74.7$--$78.3\times$ over \cfgc.
+\end{itemize}
+Below its own break-even of about $2.1\times10^{5}$, \cfgc\ is PCM-limited too,
+and lasts \emph{less} than \cfgb.
 
-The reason is structural. Blocks enter the store from the prefill admission
-path, once per request, and the write stream is therefore set by the workload's
-block footprint against the pool capacity, not by how many requests are resident
-simultaneously. HBM occupancy changes how \emph{long} a block sits before
-eviction, not how \emph{many} blocks are evicted.
-
-The practical consequence is that every endurance figure in this paper is
-\emph{concurrency-invariant}, which makes it a property of the policy and the
-pool size rather than of one operating point---considerably more robust than a
-figure measured at a single batch.
-
-\subsection{Capacity: the design point is buildable, not optimal}\label{sec:capacity}
+\textbf{Assumptions.}
+\begin{enumerate}
+  \item Perfect wear levelling in both tiers.
+  \item Flash write amplification of one.
+  \item Every write is a full-block write at both tiers.
+  \item Each writing GPU's PCM-to-HBF write ratio equals the pooled ratio.
+\end{enumerate}
+The first three are \emph{optimistic}; relaxing any of them raises \cfgd's
+threshold. The fourth is \emph{untested}, because per-GPU write counts are not
+recorded. Published chip-level PCM endurance already absorbs some cell
+variability, so a comparison must not add a further levelling penalty on top of
+it; that would double-count. The end-of-run residue (3.7--4.0\,\% of would-be
+admissions) leaves every threshold within \SI{0.04}{\percent} if those blocks
+were demoted at each configuration's own rate, and raises them by at most
+\SI{4.1}{\percent} if they were never demoted. HBF also holds the model
+weights; without static wear levelling its budget would be about
+\SI{2}{\percent} smaller.
 
 \begin{table}[t]
 \centering
-\caption{PCM capacity sweep, conversational trace (footprint
-\num{2695220} blocks). ``Requests'' is work-normalized requests to wear-out
-at WAF${=}1$.}
-\label{tab:capacity}
+\caption{Published PCM endurance. None is for the first-generation 3D XPoint
+products whose density we use.}
+\label{tab:literature}
 \small
-\begin{tabular}{rrrrr}
+\begin{tabular}{p{0.42\columnwidth}p{0.22\columnwidth}l}
 \toprule
-\textbf{GiB/GPU} & \textbf{\% footprint} & \textbf{\cfgb\ B/req} & \textbf{\cfgc\ B/req} & \textbf{\cfgb$\to$\cfgc} \\
+\textbf{Device class} & \textbf{Endurance} & \textbf{Source} \\
 \midrule
-8.2   & \SI{1}{\percent}   & \num{3443815088} & \num{1709646021} & $2.01\times$ \\
-32.9  & \SI{4}{\percent}   & \num{3407126987} & \num{1670769541} & $2.04\times$ \\
-\textbf{43.4} & \textbf{\SI{5.3}{\percent}} & \textbf{\num{3387654930}} & \textbf{\num{1651733692}} & $\mathbf{2.05\times}$ \\
-82.3  & \SI{10}{\percent}  & \num{3312823828} & \num{1582069973} & $2.09\times$ \\
-205.6 & \SI{25}{\percent}  & \num{3097571623} & \num{1369868075} & $2.26\times$ \\
-411.3 & \SI{50}{\percent}  & \num{2744303747} & \num{1016600199} & $2.70\times$ \\
-822.5 & \SI{100}{\percent} & \num{2037767995} & \num{310064447}  & $6.57\times$ \\
-1233.8 & \SI{150}{\percent} & \num{1725419749} & \textbf{0} & $\infty$ \\
+mushroom-type PCM cells (spread) & $10^{6}$--$10^{9}$ & \cite{zheng2025natcomm} \\
+ALD-confined cell, metallic liner (record) & $2\times10^{12}$ & \cite{kim2016iedm} \\
+Optane DC persistent memory (1st-gen XPoint) & not published & \cite{goetze2020pmem} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:capacity} sweeps PCM capacity across \num{150} fold. Three things
-follow.
+\textbf{Against published endurance.} Table~\ref{tab:literature} lists what is
+published. Endurance spreads widely across PCM devices because two failure
+modes, stuck-SET from elemental segregation and stuck-RESET from void
+formation, are both driven by atomic migration~\cite{kim2019mrs}; see
+also~\cite{wong2010pcm,burr2010pcm}. Mushroom-type cells
+(\numrange{1e6}{1e9}) sit above \cfgd's net-positive threshold and overlap its
+break-even. The confined-cell record sits above both.
 
-\textbf{The buildable point is on the flat foot of the curve.}
-\SI{43.4}{\gibi\byte} per GPU is \SI{5.3}{\percent} of the conversational
-footprint and \SI{10.2}{\percent} of the tool/agent one. Below roughly half the
-footprint, PCM capacity is nearly irrelevant to flash lifetime: the $2.05\times$
-benefit at the design point is bought by the \emph{write-back policy}, not by the
-capacity. This matters for how the tier should be justified---it is defensible as
-the buildable point, and the benefit is real, but it must not be presented as a
-capacity optimum.
+Our density and endurance figures come from \emph{different generations}. The
+\SI{0.62}{\giga\bit\per\milli\meter\squared} density is first-generation 3D
+XPoint, and no write endurance has been published for those products: one
+evaluation on the real hardware reports that its authors ``could not find any
+actual endurance data''~\cite{goetze2020pmem}. This mismatch is why we report
+thresholds and leave the comparison open.
 
-\textbf{The knee exists and is unbuildable.} Flash write volume collapses to zero
-only when the pool can hold the entire workload footprint, at roughly
-\SI{822}{\gibi\byte} per GPU---$19\times$ the budget. Only write-back can reach
-zero at all; write-through has a hard floor of one flash write per distinct
-block at any capacity.
+%------------------------------------------------------------------------------
+\subsection{Variants and the earlier window}\label{sec:variants}
+%------------------------------------------------------------------------------
+Until the full traces became the headline, results used the first
+\num{5000} requests. There the end-of-run residue was \SIrange{8.2}{8.4}{\percent}
+and \SIrange{16.7}{17.0}{\percent} of would-be admissions; on the full traces
+it falls to \SIrange{3.7}{4.0}{\percent}. Compared by metric, the
+\num{5000}-request window agrees:
+\begin{itemize}
+  \item \cfgb$\to$\cfgc\ is \SI{50.53}{\percent}\,/\,\SI{51.31}{\percent} raw
+        (\SI{48.38}{\percent}\,/\,\SI{46.49}{\percent} residue-adjusted);
+  \item \cfgb$\to$\cfgd\ is at least \SI{99.36}{\percent}\,/\,\SI{99.12}{\percent}
+        ($N=16$);
+  \item \cfgd's hit rate is 37.5--39.1\,\% and 6.8--7.7\,\% below \cfgb.
+\end{itemize}
 
-\textbf{Residency and write volume answer different questions.} Mean PCM
-residency crosses the median time-to-first-read at $1.8\times$ to
-$2.8\times$ the design point, i.e.\ \SIrange{77}{120}{\gibi\byte} per GPU. The tier is within a factor of two to three of being large
-enough to \emph{hold} a block until its reuse arrives, while being $19\times$
-short of keeping it off flash entirely.
-
-\textbf{Capacity buys writes and latency, never hit rate.} Prefix-cache hit rate
-is flat at \numrange{0.1624}{0.1646} and \numrange{0.4007}{0.4036} across the
-whole \num{150}-fold sweep. A block demoted to flash remains in the store index
-and is still found by lookup---it is merely served from the slower tier. PCM is a
-write absorber and, on this evidence, \emph{only} a write absorber.
-
-\subsection{The cost of read-gated demotion}
-
-Configuration \cfgd's \SI{98}{\percent} write reduction is not free. Dropping
-never-read victims removes blocks that a later request would have hit, so the
-prefix-cache hit rate falls by \SI{40.7}{\percent} (conversational,
-$0.1643 \to 0.0974$) and \SI{9.6}{\percent} (tool/agent,
-$0.4037 \to 0.3650$) at matched batch, with a corresponding rise in effective
-prefill tokens. The two traces differ sharply because tool/agent has far more
-in-window reuse, so fewer of its victims are never-read.
-
-This is the central engineering trade of the design, and it is workload
-dependent in a way that deserves emphasis: under a trace variant that perturbs
-only \SIrange{2}{5}{\percent} of the footprint, the same cost moves to
-\SI{27.7}{\percent} and \SI{3.3}{\percent}. It should be quoted with that
-sensitivity attached, never as a constant.
-
-\subsection{A falsification test}\label{sec:falsifier}
-
-The flat concurrency curve of \S\ref{sec:batch} invites an objection: perhaps it
-is an artefact of the simulator, in which HBM eviction does not feed the store.
-If an HBM eviction \emph{did} write its victim to the store, flash bytes per
-request should depend on HBM occupancy.
-
-We implemented that path behind a flag and fixed the decision rule in advance:
-with the hook enabled, if flash bytes per request at the high-batch point differ
-from the low-batch point by less than \SI{5}{\percent} on both traces, the
-hypothesis is dead. The result is \SI{+0.00}{\percent} (conversational) and
-\SI{-0.07}{\percent} (tool/agent)---the hypothesis is dead.
-
-The mechanism is now measurable. Eviction \emph{volume} itself barely moves with
-batch (\SI{+1.66}{\percent} and \SI{+1.42}{\percent} over the same $11\times$
-range), because the block allocator hands out never-touched blocks before
-recycling cached ones, so the eviction rate tracks total allocations rather than
-instantaneous occupancy. Moreover \SIrange{97.4}{98.0}{\percent} of evicted
-blocks carry a key the store already holds, making their write a no-op refresh.
-Enabling the hook raises flash writes by only
-\SIrange{1.85}{2.85}{\percent}.
-
-We report this because it is the kind of result that is easy not to look for:
-the flat curve is the paper's most load-bearing negative claim, and it survives
-a direct attempt to break it.
+Results measured under other store models are labelled as such:
+\begin{itemize}
+  \item \textbf{Copy every prompt block at admission} (the stock entry):
+        \cfgb$\to$\cfgc\ is \SI{50.81}{\percent}\,/\,\SI{50.99}{\percent}.
+        Under this model \cfgd\ is equivalent to no store: with honest
+        bookkeeping it writes nothing to flash and serves nothing.
+  \item \textbf{Concurrency} (copy-at-admission only): \cfgb\ and \cfgc\ flash
+        bytes per request moved by \SI{0.50}{\percent}\,/\,\SI{1.10}{\percent}
+        over a $12\times$ batch range. A pre-registered falsification test
+        confirmed that HBM eviction did not drive flash writes in that model
+        (\SI{+0.00}{\percent}\,/\,\SI{-0.07}{\percent}). Neither result is
+        established for the spill-only configuration, where HBM eviction is the
+        store's only writer.
+  \item \textbf{PCM capacity} (copy-at-admission, shared pool): prefix hit rate
+        was flat over a $150\times$ capacity sweep. At twice the design
+        capacity, roughly second-generation XPoint density,
+        \cfgb$\to$\cfgc\ was \SI{51.10}{\percent}\,/\,\SI{52.18}{\percent}.
+  \item \textbf{Shared versus private pools} (copy-at-admission, design
+        capacity): \cfgb\ and \cfgc\ flash bytes move by at most
+        \SI{0.22}{\percent}. The \cfgd\ difference measured then is not quoted,
+        because it was produced by the lookup-bookkeeping artefact
+        (\S\ref{sec:corrections}).
+\end{itemize}
 
 %==============================================================================
-\section{Limitations}\label{sec:limits}
+\section{Corrections, Limitations, and What Is Not Claimed}\label{sec:limits}
 %==============================================================================
 We state these in full because they bound every number above.
 
-\textbf{The store holds prompt blocks only.} Generated KV has no key space in
-the simulator and therefore never enters the store. The defensible claim is
-narrower than the motivation: \emph{PCM as a write-back buffer in front of HBF
-reduces prefix-cache offload writes by \SI{51}{\percent} (always) or
-\SI{99}{\percent} (if\_read)}. Closing this gap requires a key space for decode
-blocks. We bound what it could add: generated tokens are
-\SI{2.58}{\percent} and \SI{1.94}{\percent} of all tokens on these traces
-(\SIrange{4.0}{4.1}{\percent} measured against the store's deduplicated write
-population), so on \emph{this} workload the ceiling is a few percent. These are
-prompt-heavy traces; a workload with long generations would move that bound.
+\subsection{Corrections to earlier results}\label{sec:corrections}
+Each of the following was reported in an earlier version of this work and is
+corrected here.
+\begin{enumerate}
+  \item \textbf{The earlier headline was a saturated operating point.} It came
+        from a concurrency cap of 256, where batch differed between
+        configurations by up to \SI{7.7}{\percent} (e.g.\ \cfgb$\to$\cfgc\
+        \SI{51.2}{\percent}\,/\,\SI{52.6}{\percent}). It was replaced by a
+        batch-matched cap of 48, and later by the full-trace results above.
+  \item \textbf{The earlier draft's headline did not match its own table.} Its
+        prose quoted $90.3\times$ and $86.4\times$ lifetime improvements from a
+        batch-unmatched phase, while its table implied $79.8\times$ and
+        $58.1\times$. Lifetime ratios are now quoted only as ranges, paired with
+        bytes per request.
+  \item \textbf{A lookup bookkeeping bug produced the earlier read-gated
+        result.} \emph{if\_read} credited every block a store lookup
+        \emph{walked}, including blocks then served from HBM. Under
+        copy-at-admission, PCM never served a read in 332 runs, yet \cfgd\
+        demoted thousands of blocks. With credit given only on an actual PCM
+        serve, \cfgd\ under copy-at-admission writes nothing to flash and serves
+        nothing: it is equivalent to no store. Its earlier
+        \SIrange{99.6}{99.8}{\percent} reductions are retracted. So are the
+        ``one PCM read passes the gate'' mechanism and every analysis of
+        \cfgd's flash-write variability built on it (timing arms, replicates,
+        concurrency sweep, pooled bound); those describe the artefact, not the
+        design. The configuration of \S\ref{sec:storemodel} was adopted in
+        response.
+  \item \textbf{Only four of eight GPUs write to the store.} The simulator
+        schedules only the tensor-rank-0 worker of each data-parallel group,
+        but earlier work assumed all eight wrote. As a result, the earlier
+        \num{142213}-block PCM pool was \SI{86.8}{\gibi\byte} per writing GPU,
+        twice the design; batch figures were half their true value; and
+        requests-to-wear-out against \SI{24}{\tebi\byte} of flash were twice
+        too high, because only \SI{12}{\tebi\byte} receives the counted bytes.
+  \item \textbf{A single shared LRU served all GPUs.} One pool and one LRU
+        meant a block admitted by one GPU could evict another GPU's block;
+        \SIrange{73.6}{75.9}{\percent} of evictions were cross-GPU. In-package
+        PCM is private to its GPU, so pools are now partitioned per GPU.
+  \item \textbf{The simulator's random seed does not create replicates.} Runs
+        with seeds 0, 1 and 2 are byte-identical on these traces. An earlier
+        jitter scheme assumed millisecond timestamps, but the traces have
+        whole-second timestamps, so that jitter only reordered requests within
+        a burst. It was replaced by burst-level jitter that preserves order.
+  \item \textbf{Earlier sizing and topology errors.} A PCM tier once configured
+        at about \SI{4}{\gibi\byte}, a $10\times$ error, makes every
+        \emph{if\_read} result under it void rather than negative. Hardware
+        models that gave up HBM capacity for flash, with an invented bandwidth
+        derate, modelled the wrong topology and are superseded.
+  \item \textbf{Smaller corrections.}
+        \begin{itemize}
+          \item ``HBF never evicts'' holds only for the first \num{5000}
+                requests.
+          \item A claim that a continuation's previous output is a minority of
+                what it adds was wrong for the conversational trace, where it
+                is \SI{67.3}{\percent}.
+          \item A partial-tail sharing option intended to lift the hit-rate
+                floor lowered the hit rate instead.
+          \item An earlier PCM endurance figure, and the statement that PCM
+                endurance is ``orders of magnitude higher'' than NAND's, were
+                unsourced. Both are withdrawn.
+        \end{itemize}
+\end{enumerate}
 
-\textbf{The workload is a substitute.} The target is cache-augmented generation;
-its corpus size, sharing factor and per-request transient volume are not yet
-fixed, and the Mooncake traces stand in for it.
+\subsection{Open parameters}
 
-\textbf{FP16 is a harness limitation.} KV precision is hardcoded. FP8 would halve
-KV bytes per token, doubling effective tier capacity in blocks and improving
-every write-volume and endurance figure. Reporting at FP16 is the conservative
-choice.
+\begin{table}[t]
+\centering
+\caption{Open parameters and what each run used.}
+\label{tab:open}
+\small
+\begin{tabular}{p{0.30\columnwidth}p{0.60\columnwidth}}
+\toprule
+\textbf{Parameter} & \textbf{Status} \\
+\midrule
+PCM endurance & \textbf{open; reported as thresholds} over a swept axis
+  (\S\ref{sec:endurance}). None is published for the generation whose density
+  we use \\
+HBF write timing & \SI{200}{\micro\second}, \SI{3.0}{\gibi\byte\per\second}
+  in every run: TokenSim's stock default, \textbf{unsourced} \\
+PCM media timing & \num{0.1}/\SI{1.0}{\micro\second},
+  \num{100}/\SI{20}{\gibi\byte\per\second}: \textbf{assumed} \\
+TLC density & \SI{29}{\giga\bit\per\milli\meter\squared}: \textbf{uncited} \\
+PCM die area & \SI{35}{\milli\meter\squared}, derived from the uncited TLC
+  density: \textbf{open} \\
+HBF dies per stack & \textbf{open}; not needed, since capacity per stack is
+  sourced \\
+CAG workload & corpus size, sharing factor and transient volume
+  \textbf{open}; the Mooncake traces stand in \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:open} lists the parameters that remain unsourced or assumed,
+with the value each run used.
+
+\subsection{Limitations}
+\textbf{The store holds prompt blocks only.} Generated KV has no key in the
+simulator and never enters the store. The defensible claim is therefore about
+\emph{prefix-cache offload} writes. Generated tokens are \SI{2.58}{\percent}
+and \SI{1.94}{\percent} of all tokens on these prompt-heavy traces; a workload
+with long generations would change that.
+
+\textbf{The workload is a stand-in} for cache-augmented generation, whose
+parameters are open.
+
+\textbf{FP16 is hardcoded.} FP8 would halve every byte count and double every
+tier's capacity in blocks, so FP16 understates the benefit.
 
 \textbf{Flash reads are modelled generously.} The perfect-prefetch read
-parameters flatter the HBF-only baseline, and the prefetch argument that
-justifies them applies to H3's predictable, read-only accesses---not to the
-demand-driven hits on transient KV that this workload generates.
+parameters rest on H3's argument for predictable, read-only accesses, not for
+demand-driven cache hits. They flatter the baseline.
 
-\textbf{Lifetime \emph{ratios} are fragile; bytes per request are not.} Because
-\cfgd's flash writes are near zero, small absolute changes move the ratio by
-large factors: under the trace variant mentioned above, $80.4\times$ becomes
-$230.3\times$. Work-normalized bytes per request is the robust figure.
+\textbf{Reported hit rates are floors.} The traces' 512-token hashing prevents
+a continuation from reusing its predecessor's partial tail. Comparisons between
+configurations see the same trace and are unaffected.
 
-\textbf{PCM endurance is unpriced.} We have no sourced endurance figure for the
-PCM tier, so the write traffic it absorbs is reported but its own wear is not
-evaluated. This is the single largest open parameter in the design.
+\textbf{Flash write amplification is taken as one.} A NAND-level simulation is
+outside the scope of this work. Write amplification above one raises \cfgd's
+endurance thresholds.
 
-\textbf{No shared-bandwidth model for the far tier.} Hence no lifetime in days
-anywhere in this paper.
+\textbf{Timing sensitivity was tested only under the earlier model}
+(\S\ref{sec:method}), and the per-GPU write-ratio assumption behind the
+endurance thresholds is untested (\S\ref{sec:endurance}).
 
-Separately, the trace's \num{512}-token hash granularity against the simulator's
-\num{16}-token blocks makes a continuation unable to reuse its predecessor's
-prompt tail in \SIrange{97.9}{98.7}{\percent} of cases, affecting
-\SIrange{1.35}{1.95}{\percent} of distinct blocks. Reported hit rates are
-therefore floors. Comparisons between configurations at a fixed workload are
-unaffected, since both arms see the same trace.
+\textbf{End-of-run residue.} Blocks still in HBM when a trace ends were never
+spilled. They are \SIrange{3.7}{4.0}{\percent} of would-be admissions on the
+full traces. Absolute bytes per request are therefore slightly undercounted in
+every configuration; residue-adjusted reductions are reported alongside the raw
+ones.
+
+\subsection{What is not claimed}\label{sec:notclaimed}
+\begin{itemize}
+  \item \textbf{No latency or throughput results.} This work tests the
+        write-absorption idea on byte counts: how many bytes reach each tier,
+        and what reuse survives. The simulator's store timing is a
+        per-operation function with assumed or unsourced values, no shared
+        bandwidth and no far-tier queueing. That is adequate to schedule the
+        replay, but not to support latency or throughput results. The
+        configurations are batch-matched at 30~requests/s, and their timing
+        differences are not results. Latency and throughput are the next phase,
+        on a simulator that models them.
+  \item \textbf{No lifetime in days.} Days need a write rate, and a write rate
+        needs a shared far-tier bandwidth model, which this work does not have.
+        Wear is reported as bytes per request, reductions and endurance
+        thresholds. Lifetime ratios are given only as ranges; bytes per request
+        is the robust figure.
+  \item \textbf{No verdict on PCM wear-out.} The thresholds of
+        \S\ref{sec:endurance} are positions against published figures, not a
+        claim that PCM will or will not last.
+  \item \textbf{No claim that PCM's medium causes the halving} of
+        \S\ref{sec:identity}. It is a write-policy identity.
+  \item \textbf{No concurrency-invariance claim} for the spill-only
+        configuration; it was established only under copy-at-admission.
+\end{itemize}
 
 %==============================================================================
 \section{Related Work}
 %==============================================================================
-KV cache management in HBM is well studied: paged attention~\cite{vllm}
+KV cache management in HBM is well studied. Paged attention~\cite{vllm}
 eliminated fragmentation and enabled prefix sharing, and
 Mooncake~\cite{mooncake} extended it into a disaggregated store with DRAM and
-SSD tiers. Our work treats that store's offload tier as the object of study
-rather than its mechanism.
+SSD tiers. We treat that store's offload tier as the object of study rather
+than its mechanism.
 
 On the hardware side, H3~\cite{h3} is the direct antecedent and supplies our
 topology, capacities and latency-hiding argument. We depart from it in workload
-rather than structure: H3 confines flash to read-only data and argues endurance
-is therefore a non-issue; we accept the structure and test the write-heavy case
-it excludes. Flash-level write amplification and garbage collection behaviour,
-which would refine the WAF${=}1$ assumption used here, are addressable with an
-SSD-level simulator such as MQSim~\cite{mqsim}; that analysis is future work.
+rather than structure: H3 confines flash to read-only data and argues that
+endurance is therefore a non-issue, while we keep the structure and test the
+write-heavy case it excludes. Flash-level write amplification and garbage
+collection would refine our assumption of a write-amplification factor of one;
+an SSD-level simulator such as MQSim~\cite{mqsim} addresses them, and that
+analysis is outside our scope.
 
-Phase-change memory as a DRAM-adjacent tier has a long literature; what is new
-here is the specific role---a thin write absorber protecting a NAND tier inside a
-GPU package---and the finding that its benefit at buildable capacity comes from
-policy rather than from capacity.
+Phase-change memory is surveyed in~\cite{wong2010pcm,burr2010pcm}, and its
+cycling endurance, with the failure mechanisms behind its wide spread,
+in~\cite{kim2019mrs}. What is new here is the role, a thin non-volatile staging
+tier protecting a NAND tier inside a GPU package, and a measured selection
+policy whose PCM cost we price against that spread rather than against a
+single assumed figure.
 
 %==============================================================================
 \section{Conclusion}
 %==============================================================================
-A \SI{43.4}{\gibi\byte}-per-GPU PCM tier, stackable within the existing HBF
-footprint, absorbs \SIrange{51}{53}{\percent} of the flash write stream through
-write-back admission alone, and \SIrange{98}{99}{\percent} with read-gated
-demotion, for a $90\times$ work-normalized lifetime improvement. The benefit at
-that capacity is bought by policy, not by capacity: the design point sits on the
-flat foot of the curve, $19\times$ short of the knee.
+A \SI{43.4}{\gibi\byte}-per-GPU PCM staging tier, stacked within the existing
+HBF footprint, changes the flash write stream in two ways that must be kept
+apart. Removing the baseline's write-through copy halves flash writes, but that
+is an identity of write policy: a same-capacity volatile buffer would write the
+same bytes. The case for a non-volatile tier rests on durability, which we
+argue but cannot measure. Read-gated demotion is the measured contribution. It
+removes about \SI{99}{\percent} of the remaining flash writes, and pays for it
+with most of the store's reuse benefit, against a no-store control. Its value
+depends on PCM endurance: it outlasts write-back alone above about
+$2.4\times10^{5}$ cycles, and gains nothing further above
+\numrange{1.8e7}{2.5e7}. Published PCM devices span $10^{6}$ to $10^{9}$ cycles
+for common cells, with a $2\times10^{12}$ record, but none of those figures is
+for the generation whose density we use.
 
-Two negative results are, we think, as useful as the positive one. Flash wear is
-invariant to batch size and HBM occupancy, which removes a class of deployment
-rules that would otherwise look plausible; and that invariance survives a direct
-falsification attempt in which HBM evictions are wired into the store. The
-remaining gap is the one we name rather than paper over: generated KV does not
-yet enter the store, and on these prompt-heavy traces it is bounded at a few
-percent of all KV. Extending the key space to decode blocks, and pricing PCM's
-own endurance, are the next steps.
+The open items are named rather than papered over:
+\begin{itemize}
+  \item generated KV does not yet enter the store;
+  \item latency and throughput need a simulator that models them;
+  \item lifetimes in days need a shared far-tier bandwidth model;
+  \item PCM endurance needs a figure for the generation actually used.
+\end{itemize}
 
 %==============================================================================
-% NOTE: bibliographic details below are INCOMPLETE where marked. Verify and
-% complete them before submission -- do not submit the placeholders.
+% Bibliographic details verified 2026-10-22 against Crossref, arXiv, dblp or
+% the publisher (see Documents/Research_papers/README.md and report.md A4.1).
 %==============================================================================
-\begin{thebibliography}{9}
+\begin{thebibliography}{99}
 
 \bibitem{h3}
-SK hynix,
-``H3: a hybrid HBM and high-bandwidth flash memory hierarchy,''
-\emph{IEEE Computer Architecture Letters}, 2026.
-% TODO: complete authors, volume, issue, page range, DOI.
+M.~Ha, E.~Kim, and H.~Kim,
+``H$^{3}$: Hybrid architecture using high bandwidth memory and high bandwidth
+flash for cost-efficient LLM inference,''
+\emph{IEEE Computer Architecture Letters}, vol.~25, no.~1, pp.~49--52, 2026,
+doi:10.1109/LCA.2026.3660969.
 
 \bibitem{tokensim}
-``TokenSim: enabling hardware and software exploration for large language model
-inference systems,'' arXiv:2503.08415, 2025.
-% TODO: complete author list.
+F.~Wu, Z.~Bian, G.~Duan, T.~Xu, J.~Wu, T.~Ma, Y.~Yao, R.~Gong, and Y.~Zhuo,
+``TokenSim: Enabling hardware and software exploration for large language
+model inference systems,'' arXiv:2503.08415, 2025.
 
 \bibitem{mooncake}
-``Mooncake: a KVCache-centric disaggregated architecture for LLM serving,''
-in \emph{Proc. USENIX FAST}, 2025.
-% TODO: complete author list and page range.
+R.~Qin, Z.~Li, W.~He, J.~Cui, F.~Ren, M.~Zhang, Y.~Wu, W.~Zheng, and X.~Xu,
+``Mooncake: Trading more storage for less computation---a KVCache-centric
+architecture for serving LLM chatbot,''
+in \emph{Proc. USENIX FAST}, 2025, pp.~155--170.
 
 \bibitem{vllm}
-W. Kwon \emph{et al.},
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H. Yu, J.~Gonzalez, H.~Zhang,
+and I.~Stoica,
 ``Efficient memory management for large language model serving with
 PagedAttention,''
-in \emph{Proc. ACM SOSP}, 2023.
+in \emph{Proc. ACM SOSP}, 2023, pp.~611--626,
+doi:10.1145/3600006.3613165.
 
 \bibitem{mqsim}
 A. Tavakkol, J. G\'{o}mez-Luna, M. Sadrosadati, S. Ghose, and O. Mutlu,
 ``MQSim: a framework for enabling realistic studies of modern multi-queue SSD
 devices,''
-in \emph{Proc. USENIX FAST}, 2018.
+in \emph{Proc. USENIX FAST}, 2018, pp.~49--66.
 
 \bibitem{ehrmann2022pcm}
 A.~Ehrmann, T.~Blachowicz, G.~Ehrmann, and T.~Grethe,
@@ -671,6 +963,47 @@ doi:10.1002/appl.202200024.
 %   pages   = {e202200024}, doi = {10.1002/appl.202200024}}
 % Gives 0.62 Gb/mm^2 for 20 nm (first-generation) Optane / 3D XPoint, taken
 % from TechInsights (its ref. [127]).
+
+\bibitem{wong2010pcm}
+H.-S.~P. Wong, S.~Raoux, S.~Kim, J.~Liang, J.~P. Reifenberg, B.~Rajendran,
+M.~Asheghi, and K.~E. Goodson,
+``Phase change memory,''
+\emph{Proc. IEEE}, vol.~98, no.~12, pp.~2201--2227, 2010,
+doi:10.1109/JPROC.2010.2070050.
+
+\bibitem{burr2010pcm}
+G.~W. Burr, M.~J. Breitwisch, M.~Franceschini, D.~Garetto,
+K.~Gopalakrishnan, B.~Jackson, B.~Kurdi, C.~Lam, L.~A. Lastras, A.~Padilla,
+B.~Rajendran, S.~Raoux, and R.~S. Shenoy,
+``Phase change memory technology,''
+\emph{J. Vac. Sci. Technol. B}, vol.~28, no.~2, pp.~223--262, 2010,
+doi:10.1116/1.3301579.
+
+\bibitem{kim2019mrs}
+S.~Kim, G.~W. Burr, W.~Kim, and S.-W. Nam,
+``Phase-change memory cycling endurance,''
+\emph{MRS Bulletin}, vol.~44, no.~9, pp.~710--714, 2019,
+doi:10.1557/mrs.2019.205.
+
+\bibitem{kim2016iedm}
+W.~Kim, M.~BrightSky, T.~Masuda, N.~Sosa, S.~Kim, R.~Bruce, F.~Carta,
+G.~Fraczak, H.~Y. Cheng, A.~Ray, Y.~Zhu, H.~L. Lung, K.~Suu, and C.~Lam,
+``ALD-based confined PCM with a metallic liner toward unlimited endurance,''
+in \emph{IEEE Int. Electron Devices Meeting (IEDM)}, 2016, pp.~4.2.1--4.2.4,
+doi:10.1109/IEDM.2016.7838343.
+
+\bibitem{zheng2025natcomm}
+J.~Zheng \emph{et al.},
+``Extended switching endurance of phase change memory through nano-confined
+cell structure,''
+\emph{Nature Communications}, vol.~16, art.~5788, 2025,
+doi:10.1038/s41467-025-60644-1.
+
+\bibitem{goetze2020pmem}
+P.~G\"{o}tze, A.~K. Tharanatha, and K.-U. Sattler,
+``Data structure primitives on persistent memory: an evaluation,''
+arXiv:2001.02172, 2020. Short version in \emph{Proc. DaMoN}, 2020,
+doi:10.1145/3399666.3399900.
 
 \end{thebibliography}
 

@@ -8488,3 +8488,156 @@ unsourced. Not a measured or cited value; do not propagate.**
   density figure.
 - Area/density is supporting evidence only and is not the lead.
 - The recomputable-KV caveat on durability stands (report.md, part 2).
+
+## PCM ENDURANCE — supplied literature, and endurance as a swept axis (2026-10-22)
+
+### Literature supplied by the author (bibliographic details as supplied; to be verified against publisher records)
+
+| reference | use | status |
+|---|---|---|
+| H.-S. P. Wong *et al.*, "Phase Change Memory," *Proc. IEEE* 98(12), 2201–2227, 2010 | framing (standard architecture citation) | supplied; verify |
+| G. W. Burr *et al.*, "Phase change memory technology," *J. Vac. Sci. Technol. B* 28, 2010 | framing: retention, thermal cross-talk, endurance, bias polarity | supplied; issue and pages not given; verify |
+| W. Kim, M. BrightSky *et al.*, "Phase-change memory cycling endurance," *MRS Bulletin* 44(9), 710–714, 2019 | framing: why endurance figures spread widely (stuck-SET from elemental segregation; stuck-RESET from void formation; both atomic migration). It frames ~10¹² cycles as the record | supplied; verify. **Not to be cited for the number itself** |
+| the IEDM paper reporting the ~10¹² record | the number | **NEEDS CITATION**: not yet supplied |
+| a peer-reviewed comparison table giving NAND 10⁴–10⁵, DRAM > 10¹⁵ and Optane DC PMem "N/A" (its authors found no endurance data for the modules) | evidence that 1st-gen XPoint module endurance is unpublished | **NEEDS CITATION**: reference not supplied |
+
+**Not citable; recorded as context only.** Intel did not publish write
+endurance for Optane DC Persistent Memory.
+
+- Circulating figures are 50,000–500,000, 200,000 and 10 million cycles.
+  These are analyst back-calculations, mostly from a petabytes-written rating
+  (~360 PBW quoted for the 256 GB module) spread over a 5-year life.
+- Their sources are blogs or newsletters.
+- None of these figures enters any calculation or the paper.
+
+### Generation mismatch — stated, not hidden
+
+The PCM **density** is a 1st-gen 3D XPoint figure: 0.62 Gb/mm², Ehrmann
+*et al.* 2022 via TechInsights. **No peer-reviewed endurance figure exists for
+that generation's products.** Any published PCM endurance figure therefore
+comes from a different technology or generation, such as research cells or
+arrays. The thesis must say this wherever density and endurance appear
+together.
+
+### Endurance as a swept axis (derived from measured B/req; no new runs)
+
+PCM endurance is not fixed at any value. Instead, requests to first wear-out
+are computed for every assumed PCM endurance from 10⁵ to 10¹² cycles.
+
+- A tier wears out after capacity × endurance ÷ B/req requests (pool basis:
+  12 TiB HBF, 173.6 GiB PCM).
+- The system wears out at the first tier to do so.
+- **(b)'s buffer is DRAM and never wears out**, so (b) is HBF-limited at every
+  endurance.
+- Same assumptions as the break-even (perfect wear levelling, HBF WAF = 1,
+  full-block writes, per-rank ratio = pooled ratio [UNTESTED]).
+- Script: `scripts/phase14/breakeven_pcm.py WORK sweep`; inputs `s4_*`.
+
+
+#### Conversation — requests to first wear-out vs assumed PCM endurance
+
+| PCM endurance (cycles) | (b) | (c) | (d), N = 4 | (d) ÷ (c) | (d) ÷ (b) |
+|---|---|---|---|---|---|
+| 1e+05 | 1.3e+07 | 1.22e+07 | 1.09e+07 – 1.09e+07 | 0.89 – 0.90 | 0.84 – 0.84 |
+| 2e+05 | 1.3e+07 | 2.44e+07 | 2.19e+07 – 2.19e+07 | 0.89 – 0.90 | 1.68 – 1.68 |
+| 3e+05 | 1.3e+07 | 2.62e+07 | 3.28e+07 – 3.28e+07 | 1.25 – 1.25 | 2.51 – 2.52 |
+| 1e+06 | 1.3e+07 | 2.62e+07 | 1.09e+08 – 1.09e+08 | 4.17 – 4.18 | 8.38 – 8.40 |
+| 1e+07 | 1.3e+07 | 2.62e+07 | 1.09e+09 – 1.09e+09 | 41.72 – 41.79 | 83.81 – 83.96 |
+| 1e+08 | 1.3e+07 | 2.62e+07 | 2.38e+09 – 2.71e+09 | 90.80 – 103.30 | 182.43 – 207.54 |
+| 1e+09 | 1.3e+07 | 2.62e+07 | 2.38e+09 – 2.71e+09 | 90.80 – 103.30 | 182.43 – 207.54 |
+| 1e+10 | 1.3e+07 | 2.62e+07 | 2.38e+09 – 2.71e+09 | 90.80 – 103.30 | 182.43 – 207.54 |
+| 1e+11 | 1.3e+07 | 2.62e+07 | 2.38e+09 – 2.71e+09 | 90.80 – 103.30 | 182.43 – 207.54 |
+| 1e+12 | 1.3e+07 | 2.62e+07 | 2.38e+09 – 2.71e+09 | 90.80 – 103.30 | 182.43 – 207.54 |
+
+(d) outlives (b) when E_PCM > 119,099 – 119,313; (d) outlives (c) when E_PCM > 239,283 – 239,711 (above (c)'s own break-even 214,535, so (c) is HBF-limited there).
+
+#### Tool&Agent — requests to first wear-out vs assumed PCM endurance
+
+| PCM endurance (cycles) | (b) | (c) | (d), N = 4 | (d) ÷ (c) | (d) ÷ (b) |
+|---|---|---|---|---|---|
+| 1e+05 | 2.7e+07 | 2.53e+07 | 2.28e+07 – 2.29e+07 | 0.90 – 0.90 | 0.85 – 0.85 |
+| 2e+05 | 2.7e+07 | 5.06e+07 | 4.57e+07 – 4.57e+07 | 0.90 – 0.90 | 1.69 – 1.69 |
+| 3e+05 | 2.7e+07 | 5.43e+07 | 6.85e+07 – 6.86e+07 | 1.26 – 1.26 | 2.54 – 2.54 |
+| 1e+06 | 2.7e+07 | 5.43e+07 | 2.28e+08 – 2.29e+08 | 4.21 – 4.21 | 8.46 – 8.47 |
+| 1e+07 | 2.7e+07 | 5.43e+07 | 2.28e+09 – 2.29e+09 | 42.09 – 42.13 | 84.60 – 84.69 |
+| 1e+08 | 2.7e+07 | 5.43e+07 | 4.05e+09 – 4.25e+09 | 74.66 – 78.26 | 150.08 – 157.32 |
+| 1e+09 | 2.7e+07 | 5.43e+07 | 4.05e+09 – 4.25e+09 | 74.66 – 78.26 | 150.08 – 157.32 |
+| 1e+10 | 2.7e+07 | 5.43e+07 | 4.05e+09 – 4.25e+09 | 74.66 – 78.26 | 150.08 – 157.32 |
+| 1e+11 | 2.7e+07 | 5.43e+07 | 4.05e+09 – 4.25e+09 | 74.66 – 78.26 | 150.08 – 157.32 |
+| 1e+12 | 2.7e+07 | 5.43e+07 | 4.05e+09 – 4.25e+09 | 74.66 – 78.26 | 150.08 – 157.32 |
+
+(d) outlives (b) when E_PCM > 118,082 – 118,202; (d) outlives (c) when E_PCM > 237,355 – 237,596 (above (c)'s own break-even 214,657, so (c) is HBF-limited there).
+
+**Two thresholds, with different meanings:**
+
+| threshold | Conv | T&A | meaning |
+|---|---|---|---|
+| **(d) outlives (c)** | **239,283 – 239,711** | **237,355 – 237,596** | above this, (d)'s system lasts longer than (c)'s. This is where read-gating becomes net-positive |
+| (d) outlives (b) | 119,099 – 119,313 | 118,082 – 118,202 | above this, (d) outlasts the DRAM-buffer baseline |
+| break-even E_PCM for (d) (Result 4) | 21.7 – 24.8 M | 17.7 – 18.6 M | above this, (d) is HBF-limited and more PCM endurance buys nothing |
+
+How (d) compares with (c) across the range:
+
+- **Below ~2.4 × 10⁵ cycles**, (d) wears PCM out before (c) does. It writes
+  more to PCM: +11.5–11.7% / +10.6–10.7% PCM B/req. So (d) ÷ (c) = 0.89–0.90.
+  Below its own break-even (~2.1 × 10⁵), (c) also becomes PCM-limited, and it
+  then lasts **less** than (b).
+- **Between ~2.4 × 10⁵ and the break-even**, (d)'s advantage over (c) grows in
+  proportion to PCM endurance.
+- **Above the break-even** it plateaus at ×90.8–×103.3 / ×74.7–×78.3, the HBF
+  write ratio.
+
+**Correction to the supplied note.** It prices (d)'s re-admission wear at
+"+15.4% / +13.1%". No measured quantity matches that.
+
+| measured quantity | Conv | T&A |
+|---|---|---|
+| (d) PCM B/req over (c) | +11.54% to +11.74% | +10.57% to +10.69% |
+| re-admissions as a share of (d)'s PCM writes | 10.33–10.46% | 9.71–9.77% |
+| re-admissions per first-time admission | 11.52–11.69% | 10.75–10.83% |
+
+The sweep uses the measured B/req directly.
+
+## PCM ENDURANCE LITERATURE — verified references (2026-10-22)
+
+Each reference was checked against Crossref (DOI metadata) and/or the
+publisher or author page. The table below **supersedes the "supplied; verify"
+table above.**
+
+| key | reference (verified) | verified via | used for |
+|---|---|---|---|
+| `kim2016iedm` | W. Kim, M. BrightSky, T. Masuda, N. Sosa, S. Kim, R. Bruce, F. Carta, G. Fraczak, H. Y. Cheng, A. Ray, Y. Zhu, H. L. Lung, K. Suu, C. Lam, "ALD-based confined PCM with a metallic liner toward unlimited endurance," *IEDM 2016*, pp. 4.2.1–4.2.4, doi:10.1109/IEDM.2016.7838343 | Crossref; cited as ref. [15] in Zheng *et al.* 2025; IBM Research abstract | **the record: ~2 × 10¹² cycles** (IBM abstract: "a new record endurance (2×10¹² cycles)"). Cite this paper, not a review, for the number |
+| `zheng2025natcomm` | J. Zheng *et al.* (15 authors), "Extended switching endurance of phase change memory through nano-confined cell structure," *Nature Communications* 16, 5788, 2025, doi:10.1038/s41467-025-60644-1 (open access) | publisher / PMC | **framing sentence for the spread**: "many PCM devices exhibit endurance limits in the range of 1 × 10⁶ to 1 × 10⁹ cycles for the mushroom-type structure", while "the confined PCM structures by atomic layer deposition (ALD) process have been reported exceeding 1 × 10¹² cycles" (its refs [10–12] and [13–15]). Its own device reaches > 1.1 × 10¹¹ |
+| `kim2019mrs` | S. Kim, G. W. Burr, W. Kim, S.-W. Nam, "Phase-change memory cycling endurance," *MRS Bulletin* 44(9), 710–714, 2019, doi:10.1557/mrs.2019.205 | Crossref; KNU research portal | **why the figures spread:** stuck-SET (elemental segregation) and stuck-RESET (void formation), both driven by atomic migration. Framing only |
+| `goetze2020pmem` | P. Götze, A. K. Tharanatha, K.-U. Sattler, "Data Structure Primitives on Persistent Memory: An Evaluation," arXiv:2001.02172, 2020. Also a short paper at DaMoN 2020 (ACM, doi:10.1145/3399666.3399900) | arXiv PDF read directly; Crossref | **the negative claim:** Table 1 gives write endurance > 10¹⁵ (DRAM), **N/A (Optane DC)**, 10⁴–10⁵ (NAND flash). The text says "we could not find any actual endurance data of the DCPMMs". The table compiles other sources (its refs [19, 23, 25, 28]), so it is **not** a source for the DRAM or NAND numbers. The table was checked in the arXiv version; it is not confirmed whether the 3-page DaMoN version contains it, so cite the arXiv version for it |
+| `burr2010pcm` | G. W. Burr, M. J. Breitwisch, M. Franceschini, D. Garetto, K. Gopalakrishnan, B. Jackson, B. Kurdi, C. Lam, L. A. Lastras, A. Padilla, B. Rajendran, S. Raoux, R. S. Shenoy, "Phase change memory technology," *J. Vac. Sci. Technol. B* 28(2), 223–262, 2010, doi:10.1116/1.3301579 | Crossref; arXiv:1001.1164 | framing (survey) |
+| `wong2010pcm` | H.-S. P. Wong, S. Raoux, S. Kim, J. Liang, J. P. Reifenberg, B. Rajendran, M. Asheghi, K. E. Goodson, "Phase Change Memory," *Proc. IEEE* 98(12), 2201–2227, 2010, doi:10.1109/JPROC.2010.2070050 | Crossref | framing (standard architecture citation) |
+
+**Corrections to the supplied notes:**
+
+- The MRS Bulletin review has **four** authors (S. Kim, G. W. Burr, W. Kim,
+  S.-W. Nam), not two.
+- The Götze *et al.* paper **does** have a peer-reviewed venue: DaMoN 2020, a
+  short paper. The table was checked only in the arXiv version.
+
+**HBM3E die area: still no source.** J. Lee *et al.*, "13.4 A 48GB 16-High
+1280GB/s HBM3E DRAM with All-Around Power TSV and a 6-Phase RDQS Scheme for TSV
+Area Optimization," *ISSCC 2024*, pp. 238–240,
+doi:10.1109/ISSCC49657.2024.10454440 (Crossref) is the right paper to look in.
+
+- Its abstract gives no die area.
+- A 120 mm² per-die figure circulates, but it is another paper's
+  *assumption*.
+- DRAM density stays **PLACEHOLDER**.
+
+**How the endurance literature maps onto the thresholds** (stated as
+positions, not a verdict):
+
+- Mushroom-cell devices span 10⁶–10⁹ (Zheng *et al.* 2025). That is above
+  (d)'s net-positive threshold (≈ 2.4 × 10⁵). It overlaps (d)'s break-even
+  (1.8–2.5 × 10⁷).
+- The confined-cell record, 2 × 10¹² (Kim *et al.* IEDM 2016), is above
+  both.
+- **None of these figures is for the 1st-gen XPoint generation whose density
+  we use.** No endurance is published for those products (Götze *et al.*).
+  The generation mismatch stands.
